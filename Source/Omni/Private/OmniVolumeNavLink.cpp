@@ -27,6 +27,9 @@ AOmniVolumeNavLink::AOmniVolumeNavLink()
     SourceBox->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     SourceBox->SetGenerateOverlapEvents(false);
     SourceBox->SetCanEverAffectNavigation(false);
+    SourceBox->ShapeColor = FColor(70, 200, 255);
+    SourceBox->SetLineThickness(3.0f);
+    SourceBox->bDrawOnlyIfSelected = true;
 
     TargetBox = CreateDefaultSubobject<UBoxComponent>(TEXT("TargetBox"));
     TargetBox->SetupAttachment(SceneRoot);
@@ -35,6 +38,9 @@ AOmniVolumeNavLink::AOmniVolumeNavLink()
     TargetBox->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     TargetBox->SetGenerateOverlapEvents(false);
     TargetBox->SetCanEverAffectNavigation(false);
+    TargetBox->ShapeColor = FColor(255, 160, 60);
+    TargetBox->SetLineThickness(3.0f);
+    TargetBox->bDrawOnlyIfSelected = true;
 
     GeneratedLinks = CreateDefaultSubobject<UNavLinkComponent>(TEXT("GeneratedLinks"));
     GeneratedLinks->SetupAttachment(SceneRoot);
@@ -43,12 +49,17 @@ AOmniVolumeNavLink::AOmniVolumeNavLink()
 
     AreaClass = UNavArea_Default::StaticClass();
     SupportedAgents = FNavAgentSelector(FNavAgentSelector::AllAgentsMask);
+    GenerationStatus = FText::FromString(TEXT("Place Source and Target over navigable regions."));
 }
 
 void AOmniVolumeNavLink::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-    RegenerateLinks();
+    ApplyEditorVisualStyle();
+    if (bAutoRegenerate)
+    {
+        RegenerateLinks();
+    }
 }
 
 void AOmniVolumeNavLink::PostRegisterAllComponents()
@@ -122,6 +133,7 @@ void AOmniVolumeNavLink::RegenerateLinks()
     }
 
     GeneratedLinkCount = NewLinks.Num();
+    UpdateGenerationStatus();
 
     if (AreLinkArraysEquivalent(GeneratedLinks->Links, NewLinks))
     {
@@ -134,6 +146,65 @@ void AOmniVolumeNavLink::RegenerateLinks()
     NotifyNavigationSystem();
 }
 
+
+void AOmniVolumeNavLink::SwapSourceAndTarget()
+{
+    if (!SourceBox || !TargetBox)
+    {
+        return;
+    }
+
+    SourceBox->Modify();
+    TargetBox->Modify();
+
+    const FTransform SourceTransform = SourceBox->GetRelativeTransform();
+    const FVector SourceExtent = SourceBox->GetUnscaledBoxExtent();
+    const FTransform TargetTransform = TargetBox->GetRelativeTransform();
+    const FVector TargetExtent = TargetBox->GetUnscaledBoxExtent();
+
+    SourceBox->SetRelativeTransform(TargetTransform);
+    SourceBox->SetBoxExtent(TargetExtent);
+    TargetBox->SetRelativeTransform(SourceTransform);
+    TargetBox->SetBoxExtent(SourceExtent);
+
+    ApplyEditorVisualStyle();
+    RegenerateLinks();
+}
+
+void AOmniVolumeNavLink::MatchTargetSizeToSource()
+{
+    if (!SourceBox || !TargetBox)
+    {
+        return;
+    }
+
+    TargetBox->Modify();
+    TargetBox->SetBoxExtent(SourceBox->GetUnscaledBoxExtent());
+    TargetBox->SetRelativeScale3D(SourceBox->GetRelativeScale3D());
+    ApplyEditorVisualStyle();
+    RegenerateLinks();
+}
+
+void AOmniVolumeNavLink::ResetVolumes()
+{
+    if (!SourceBox || !TargetBox)
+    {
+        return;
+    }
+
+    SourceBox->Modify();
+    TargetBox->Modify();
+
+    SourceBox->SetRelativeTransform(FTransform(FQuat::Identity, FVector(-300.0, 0.0, 0.0), FVector::OneVector));
+    SourceBox->SetBoxExtent(FVector(150.0, 300.0, 75.0));
+
+    TargetBox->SetRelativeTransform(FTransform(FQuat::Identity, FVector(300.0, 0.0, 0.0), FVector::OneVector));
+    TargetBox->SetBoxExtent(FVector(150.0, 300.0, 75.0));
+
+    ApplyEditorVisualStyle();
+    RegenerateLinks();
+}
+
 bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSourceVolume, TArray<FProjectedGridSample>& OutSamples)
 {
     OutSamples.Reset();
@@ -144,7 +215,7 @@ bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSour
 
     const double WorldLengthX = 2.0 * Extent.X * FMath::Abs(Scale.X);
     const double WorldLengthY = 2.0 * Extent.Y * FMath::Abs(Scale.Y);
-    const double SafeSpacing = FMath::Max(10.0f, LinkSpacing);
+    const double SafeSpacing = FMath::Max(10.0f, GetEffectiveLinkSpacing());
 
     int32 SampleCountX = CalculateAxisSampleCount(WorldLengthX, SafeSpacing);
     int32 SampleCountY = CalculateAxisSampleCount(WorldLengthY, SafeSpacing);
@@ -154,6 +225,7 @@ bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSour
 
     if (InitialSampleCount > SafeMaximumSamples)
     {
+        bGridSampleCapReached = true;
         const double ScaleFactor = FMath::Sqrt(static_cast<double>(InitialSampleCount) / static_cast<double>(SafeMaximumSamples));
         const double AdjustedSpacing = SafeSpacing * ScaleFactor;
         SampleCountX = CalculateAxisSampleCount(WorldLengthX, AdjustedSpacing);
@@ -368,7 +440,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     }
 
     FNavigationLink& NewLink = InOutLinks.Emplace_GetRef(SourceLocal, TargetLocal);
-    NewLink.Direction = Direction;
+    NewLink.Direction = GetNativeDirection();
     NewLink.SnapRadius = FMath::Max(1.0f, SnapRadius);
     NewLink.LeftProjectHeight = FMath::Max(0.0f, NativeProjectionHeight);
     NewLink.MaxFallDownLength = FMath::Max(0.0f, NativeProjectionHeight);
@@ -443,6 +515,105 @@ int32 AOmniVolumeNavLink::FindNearestSampleIndex(const FVector& Point, const TAr
     return BestIndex;
 }
 
+
+float AOmniVolumeNavLink::GetEffectiveLinkSpacing() const
+{
+    switch (CoverageDensity)
+    {
+    case EOmniCoverageDensity::Sparse:
+        return 200.0f;
+    case EOmniCoverageDensity::Dense:
+        return 50.0f;
+    case EOmniCoverageDensity::Custom:
+        return FMath::Max(10.0f, LinkSpacing);
+    case EOmniCoverageDensity::Balanced:
+    default:
+        return 100.0f;
+    }
+}
+
+ENavLinkDirection::Type AOmniVolumeNavLink::GetNativeDirection() const
+{
+    switch (LinkDirection)
+    {
+    case EOmniVolumeLinkDirection::SourceToTarget:
+        return ENavLinkDirection::LeftToRight;
+    case EOmniVolumeLinkDirection::TargetToSource:
+        return ENavLinkDirection::RightToLeft;
+    case EOmniVolumeLinkDirection::BothWays:
+    default:
+        return ENavLinkDirection::BothWays;
+    }
+}
+
+void AOmniVolumeNavLink::UpdateGenerationStatus()
+{
+    if (!bEnabled)
+    {
+        GenerationStatus = FText::FromString(TEXT("Disabled. No links are being generated."));
+        return;
+    }
+
+    if (ValidSourceSampleCount == 0)
+    {
+        GenerationStatus = FText::FromString(TEXT("No NavMesh found inside Source Box. Move or resize Source over a navigable region."));
+        return;
+    }
+
+    if (ValidTargetSampleCount == 0)
+    {
+        GenerationStatus = FText::FromString(TEXT("No NavMesh found inside Target Box. Move or resize Target over a navigable region."));
+        return;
+    }
+
+    if (GeneratedLinkCount == 0)
+    {
+        if (RejectedDistanceCount > 0)
+        {
+            GenerationStatus = FText::FromString(TEXT("No links generated. The volumes may be farther apart than Max Crossing Distance."));
+        }
+        else
+        {
+            GenerationStatus = FText::FromString(TEXT("No valid links generated. Check the two volumes and expand Advanced only if projection needs tuning."));
+        }
+        return;
+    }
+
+    const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
+    if (GeneratedLinkCount >= SafeMaximumLinks)
+    {
+        GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links. Maximum Generated Links was reached."), GeneratedLinkCount));
+        return;
+    }
+
+    if (bGridSampleCapReached)
+    {
+        GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links. Grid sampling was automatically limited by the safety cap."), GeneratedLinkCount));
+        return;
+    }
+
+    GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links."), GeneratedLinkCount));
+}
+
+void AOmniVolumeNavLink::ApplyEditorVisualStyle()
+{
+    if (SourceBox)
+    {
+        SourceBox->ShapeColor = FColor(70, 200, 255);
+        SourceBox->SetLineThickness(3.0f);
+        SourceBox->bDrawOnlyIfSelected = true;
+        SourceBox->MarkRenderStateDirty();
+    }
+
+    if (TargetBox)
+    {
+        TargetBox->ShapeColor = FColor(255, 160, 60);
+        TargetBox->SetLineThickness(3.0f);
+        TargetBox->bDrawOnlyIfSelected = true;
+        TargetBox->MarkRenderStateDirty();
+    }
+}
+
 void AOmniVolumeNavLink::ResetDebugCounters()
 {
     GeneratedLinkCount = 0;
@@ -456,6 +627,7 @@ void AOmniVolumeNavLink::ResetDebugCounters()
     RejectedOutsideVolumeCount = 0;
     RejectedDistanceCount = 0;
     MergedDuplicateCount = 0;
+    bGridSampleCapReached = false;
 }
 
 void AOmniVolumeNavLink::NotifyNavigationSystem()
@@ -511,14 +683,29 @@ void AOmniVolumeNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 
     UnbindNavigationGenerationDelegate();
     BindNavigationGenerationDelegate();
-    RegenerateLinks();
+    ApplyEditorVisualStyle();
+
+    const FName PropertyName = PropertyChangedEvent.Property ? PropertyChangedEvent.Property->GetFName() : NAME_None;
+    const FName AutoRegenerateName = GET_MEMBER_NAME_CHECKED(AOmniVolumeNavLink, bAutoRegenerate);
+
+    if (bAutoRegenerate || PropertyName == AutoRegenerateName)
+    {
+        if (bAutoRegenerate)
+        {
+            RegenerateLinks();
+        }
+        else
+        {
+            GenerationStatus = FText::FromString(TEXT("Automatic updates are off. Use Regenerate Links after editing volumes."));
+        }
+    }
 }
 
 void AOmniVolumeNavLink::PostEditMove(bool bFinished)
 {
     Super::PostEditMove(bFinished);
 
-    if (bFinished)
+    if (bFinished && bAutoRegenerate)
     {
         RegenerateLinks();
     }
@@ -527,6 +714,7 @@ void AOmniVolumeNavLink::PostEditMove(bool bFinished)
 void AOmniVolumeNavLink::PostEditUndo()
 {
     Super::PostEditUndo();
+    ApplyEditorVisualStyle();
     RegenerateLinks();
 }
 #endif

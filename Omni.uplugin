@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 4,
-  "VersionName": "0.3.0",
+  "Version": 5,
+  "VersionName": "0.4.0",
   "FriendlyName": "Omni",
-  "Description": "Volume-to-volume navigation link authoring using generated native Unreal navigation links.",
+  "Description": "User-friendly volume-to-volume navigation link authoring using generated native Unreal navigation links.",
   "Category": "AI",
   "CreatedBy": "Mippi the Dork",
   "EngineVersion": "5.8.0",

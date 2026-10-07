@@ -12,13 +12,37 @@ class UNavAreaBase;
 class UNavLinkComponent;
 class USceneComponent;
 
+/** User-facing traversal direction. Source is always the Source Box, Target is always the Target Box. */
+UENUM(BlueprintType)
+enum class EOmniVolumeLinkDirection : uint8
+{
+    BothWays UMETA(DisplayName="Both Ways"),
+    SourceToTarget UMETA(DisplayName="Source to Target"),
+    TargetToSource UMETA(DisplayName="Target to Source")
+};
+
+/** Simple authoring presets for grid density. */
+UENUM(BlueprintType)
+enum class EOmniCoverageDensity : uint8
+{
+    Sparse UMETA(DisplayName="Sparse"),
+    Balanced UMETA(DisplayName="Balanced"),
+    Dense UMETA(DisplayName="Dense"),
+    Custom UMETA(DisplayName="Custom")
+};
+
 /**
  * Designer-authored volume-to-volume navigation link.
  *
- * Omni samples the horizontal footprint of SourceBox and TargetBox as 2D grids,
- * projects candidates to the current NavMesh, pairs each valid sample with the
- * nearest valid sample in the opposite volume, and publishes the surviving
- * results as ordinary FNavigationLink entries through a native UNavLinkComponent.
+ * Normal workflow:
+ * 1. Place the actor.
+ * 2. Move/resize Source Box over one navigable region.
+ * 3. Move/resize Target Box over the region it should connect to.
+ * 4. Choose Direction and Coverage Density.
+ *
+ * Omni projects a horizontal grid inside each volume to NavMesh, pairs valid
+ * samples between the two regions, and publishes ordinary FNavigationLink
+ * entries through a native UNavLinkComponent.
  */
 UCLASS(Blueprintable)
 class OMNI_API AOmniVolumeNavLink : public AActor
@@ -38,126 +62,156 @@ public:
     virtual void PostEditUndo() override;
 #endif
 
-    /** Rebuild generated native links from the current box transforms and NavMesh. */
-    UFUNCTION(CallInEditor, Category="Omni|Generation", meta=(DisplayName="Regenerate Links"))
+    /** Force an immediate refresh from the current Source/Target volumes. */
+    UFUNCTION(CallInEditor, Category="Omni|Actions", meta=(DisplayName="Regenerate Links"))
     void RegenerateLinks();
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Components")
-    TObjectPtr<USceneComponent> SceneRoot;
+    /** Swap the physical Source and Target volume placements. Useful when authoring one-way traversal. */
+    UFUNCTION(CallInEditor, Category="Omni|Actions", meta=(DisplayName="Swap Source and Target"))
+    void SwapSourceAndTarget();
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Components")
-    TObjectPtr<UBoxComponent> SourceBox;
+    /** Copy Source Box size/scale to Target Box while preserving the Target position and rotation. */
+    UFUNCTION(CallInEditor, Category="Omni|Actions", meta=(DisplayName="Match Target Size to Source"))
+    void MatchTargetSizeToSource();
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Components")
-    TObjectPtr<UBoxComponent> TargetBox;
+    /** Restore the two authoring volumes to Omni's default placement and size. */
+    UFUNCTION(CallInEditor, Category="Omni|Actions", meta=(DisplayName="Reset Volumes"))
+    void ResetVolumes();
 
-    /** Native Unreal component containing Omni's generated FNavigationLink array. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Components")
-    TObjectPtr<UNavLinkComponent> GeneratedLinks;
-
-    /** Enables or disables all generated links for this Omni actor. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Generation")
+    /** Master switch for this Omni connection. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayPriority="1"))
     bool bEnabled = true;
 
-    /** Approximate world-space distance between candidate grid points in each volume. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Generation", meta=(ClampMin="10.0", UIMin="25.0", UIMax="500.0", Units="cm"))
+    /** Traversal direction using the clearly named Source and Target volumes. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Direction", DisplayPriority="2"))
+    EOmniVolumeLinkDirection LinkDirection = EOmniVolumeLinkDirection::BothWays;
+
+    /**
+     * Controls how densely Omni samples each volume.
+     * Sparse = 200 cm, Balanced = 100 cm, Dense = 50 cm.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayPriority="3"))
+    EOmniCoverageDensity CoverageDensity = EOmniCoverageDensity::Balanced;
+
+    /** Used only when Coverage Density is Custom. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Custom Spacing", ClampMin="10.0", UIMin="25.0", UIMax="500.0", Units="cm", EditCondition="CoverageDensity == EOmniCoverageDensity::Custom", EditConditionHides, DisplayPriority="4"))
     float LinkSpacing = 100.0f;
 
-    /** Maximum world-space distance allowed between projected source and target endpoints. Zero disables this limit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Generation", meta=(ClampMin="0.0", UIMin="0.0", UIMax="5000.0", Units="cm"))
+    /** Longest Source-to-Target crossing Omni may create. Zero disables this limit. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Max Crossing Distance", ClampMin="0.0", UIMin="0.0", UIMax="5000.0", Units="cm", DisplayPriority="5"))
     float MaximumLinkDistance = 2000.0f;
 
-    /** Extent used by ProjectPointToNavigation around every candidate endpoint. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Projection", meta=(ClampMin="0.0"))
+    /** Plain-English result of the most recent generation pass. */
+    UPROPERTY(VisibleAnywhere, Transient, Category="Omni|Status", meta=(DisplayName="Status"))
+    FText GenerationStatus;
+
+    /** Current number of native navigation links generated by this actor. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Status", meta=(DisplayName="Generated Links"))
+    int32 GeneratedLinkCount = 0;
+
+    /** Valid NavMesh samples found inside Source Box. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Status", meta=(DisplayName="Source Nav Samples"))
+    int32 ValidSourceSampleCount = 0;
+
+    /** Valid NavMesh samples found inside Target Box. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Status", meta=(DisplayName="Target Nav Samples"))
+    int32 ValidTargetSampleCount = 0;
+
+    // ---------------------------------------------------------------------
+    // Advanced authoring. Defaults should be appropriate for most actors.
+    // ---------------------------------------------------------------------
+
+    /** Automatically regenerate after editor property/component changes. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    bool bAutoRegenerate = true;
+
+    /** Re-evaluate this actor after Unreal finishes rebuilding navigation. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    bool bRegenerateAfterNavigationBuild = true;
+
+    /** Extent used by ProjectPointToNavigation around each candidate. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="0.0", AdvancedDisplay))
     FVector ProjectionExtent = FVector(75.0f, 75.0f, 200.0f);
 
-    /** Projected points must remain within their authoring volume, with this extra tolerance. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Projection", meta=(ClampMin="0.0", Units="cm"))
+    /** Projected points may exceed the exact authoring box by this small tolerance. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="0.0", Units="cm", AdvancedDisplay))
     float ProjectionContainmentTolerance = 25.0f;
 
-    /** Reject projections that move farther than this from the raw candidate. Zero disables this limit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Projection", meta=(ClampMin="0.0", Units="cm"))
+    /** Reject projections that move farther than this from the raw grid point. Zero disables this limit. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="0.0", Units="cm", AdvancedDisplay))
     float MaximumProjectionDistance = 300.0f;
 
     /** Native Recast snap radius assigned to each generated link. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Navigation", meta=(ClampMin="1.0", Units="cm"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="1.0", Units="cm", AdvancedDisplay))
     float SnapRadius = 30.0f;
 
-    /** Native downward endpoint projection used when Recast attaches generated links to polygons. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Navigation", meta=(ClampMin="0.0", Units="cm"))
+    /** Native downward endpoint projection used when Recast attaches links to polygons. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="0.0", Units="cm", AdvancedDisplay))
     float NativeProjectionHeight = 100.0f;
 
-    /** Traversal direction applied to every generated native link. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Navigation")
-    TEnumAsByte<ENavLinkDirection::Type> Direction = ENavLinkDirection::BothWays;
-
-    /** Navigation area class applied to every generated native link. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Navigation")
+    /** Navigation area class applied to generated links. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(AdvancedDisplay))
     TSubclassOf<UNavAreaBase> AreaClass;
 
     /** Nav agents allowed to use generated links. */
-    UPROPERTY(EditAnywhere, Category="Omni|Navigation")
+    UPROPERTY(EditAnywhere, Category="Omni|Advanced", meta=(AdvancedDisplay))
     FNavAgentSelector SupportedAgents;
 
-    /** Candidates whose endpoints are nearly identical to an existing link are merged. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Optimization", meta=(ClampMin="0.0", UIMin="0.0", UIMax="250.0", Units="cm"))
+    /** Candidate endpoint pairs inside this distance are merged. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="0.0", UIMin="0.0", UIMax="250.0", Units="cm", AdvancedDisplay))
     float EndpointMergeDistance = 25.0f;
 
-    /** Hard safety cap for projected grid samples gathered from each volume before pairing. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Optimization", meta=(ClampMin="1", ClampMax="4096", UIMin="16", UIMax="1024"))
+    /** Safety cap for projected grid samples gathered from each volume. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="1", ClampMax="4096", UIMin="16", UIMax="1024", AdvancedDisplay))
     int32 MaximumGridSamplesPerVolume = 512;
 
-    /** Hard safety cap for generated native links. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Optimization", meta=(ClampMin="1", ClampMax="1024", UIMin="1", UIMax="512"))
+    /** Safety cap for native links generated by one Omni actor. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Advanced", meta=(ClampMin="1", ClampMax="1024", UIMin="1", UIMax="512", AdvancedDisplay))
     int32 MaximumGeneratedLinks = 256;
 
-    /** Regenerate after Unreal reports that navigation generation has completed. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Generation")
-    bool bRegenerateAfterNavigationBuild = true;
+    // ---------------------------------------------------------------------
+    // Diagnostics. Useful when Status says coverage could not be generated.
+    // ---------------------------------------------------------------------
 
-    /** Current number of generated native links. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
-    int32 GeneratedLinkCount = 0;
-
-    /** Raw grid candidates generated inside Source Box before NavMesh projection. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 SourceGridCandidateCount = 0;
 
-    /** Raw grid candidates generated inside Target Box before NavMesh projection. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 TargetGridCandidateCount = 0;
 
-    /** Source grid candidates that successfully projected to NavMesh inside Source Box. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
-    int32 ValidSourceSampleCount = 0;
-
-    /** Target grid candidates that successfully projected to NavMesh inside Target Box. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
-    int32 ValidTargetSampleCount = 0;
-
-    /** Number of projected source/target pairs evaluated in the most recent generation pass. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 CandidateCount = 0;
 
-    /** Source grid candidates rejected because they could not project to NavMesh. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 RejectedSourceProjectionCount = 0;
 
-    /** Target grid candidates rejected because they could not project to NavMesh. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 RejectedTargetProjectionCount = 0;
 
-    /** Grid candidates rejected because the projected point left its authoring volume. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 RejectedOutsideVolumeCount = 0;
 
-    /** Candidate pairs rejected by MaximumLinkDistance. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 RejectedDistanceCount = 0;
 
-    /** Candidate pairs merged with an existing link. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Debug")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 MergedDuplicateCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Grid Sample Cap Reached"))
+    bool bGridSampleCapReached = false;
+
+    // Components remain accessible when needed, but are not part of the normal setup workflow.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    TObjectPtr<USceneComponent> SceneRoot;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    TObjectPtr<UBoxComponent> SourceBox;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    TObjectPtr<UBoxComponent> TargetBox;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    TObjectPtr<UNavLinkComponent> GeneratedLinks;
 
 private:
     struct FProjectedGridSample
@@ -179,6 +233,10 @@ private:
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     static int32 CalculateAxisSampleCount(double WorldLength, double Spacing);
     static int32 FindNearestSampleIndex(const FVector& Point, const TArray<FProjectedGridSample>& Samples);
+    float GetEffectiveLinkSpacing() const;
+    ENavLinkDirection::Type GetNativeDirection() const;
+    void UpdateGenerationStatus();
+    void ApplyEditorVisualStyle();
     void ResetDebugCounters();
     void NotifyNavigationSystem();
     void BindNavigationGenerationDelegate();

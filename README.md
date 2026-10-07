@@ -4,9 +4,9 @@ Omni is an Unreal Engine navigation authoring plugin for creating broad traversa
 
 ## Current development version
 
-**Omni 0.3.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.4.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build upgrades the Volume-to-Volume actor from line sampling to true 2D volume-footprint coverage while retaining the Phase 0 test actor as a known-good baseline.
+This development build is a UX pass over the Volume-to-Volume workflow. Source and Target are color-coded, normal setup is reduced to a few designer-facing controls, technical settings are moved behind Advanced, and plain-English status feedback explains why coverage is or is not being generated.
 
 ## Omni Volume NavLink
 
@@ -15,12 +15,12 @@ Place an `OmniVolumeNavLink` and position its **Source Box** and **Target Box** 
 Omni:
 
 1. Treats each box's local X/Y footprint as a 2D authoring region.
-2. Builds a grid of candidate points across each volume using **Link Spacing**.
+2. Builds a grid of candidate points across each volume using the selected **Coverage Density**.
 3. Projects every grid point to Unreal navigation data.
 4. Rejects projections that fail, move too far, or leave their authoring volume.
 5. Pairs every valid Source sample with its nearest valid Target sample.
 6. Performs the reverse Target-to-Source pairing so differently sized volumes retain coverage on both sides.
-7. Rejects links beyond **Maximum Link Distance**.
+7. Rejects links beyond **Max Crossing Distance**.
 8. Deduplicates nearly identical endpoint pairs.
 9. Publishes the surviving connections as ordinary native `FNavigationLink` entries through a `UNavLinkComponent`.
 
@@ -30,25 +30,48 @@ The generated links are internal data. Omni does not spawn generated NavLinkProx
 
 The useful navigation surface is normally the NavMesh under the volume, so Omni samples the box footprint rather than stacking samples vertically. Multiple Z samples would usually project onto the same walkable polygons and create duplicate links. The box's Z extent still matters because projected points must remain inside the authoring volume.
 
-### Main settings
+### Normal workflow
 
-- **Enabled**: Enables or removes the generated links.
-- **Link Spacing**: Approximate world-space spacing between grid candidates in each volume.
-- **Maximum Link Distance**: Rejects links longer than the configured distance. Zero disables the limit.
-- **Projection Extent**: NavMesh projection search extent around each candidate.
-- **Projection Containment Tolerance**: Allows a small amount of projection movement beyond the exact authoring box boundary.
-- **Maximum Projection Distance**: Rejects projections that move too far from the raw grid point. Zero disables the limit.
-- **Direction**: Both Ways, Left to Right, or Right to Left.
-- **Area Class**: Native navigation area assigned to generated links.
-- **Supported Agents**: Native Unreal nav-agent mask.
-- **Endpoint Merge Distance**: Merges nearly identical generated links.
-- **Maximum Grid Samples Per Volume**: Safety cap for projected grid candidates gathered from each box.
-- **Maximum Generated Links**: Safety cap for native links published by one Omni actor.
-- **Regenerate After Navigation Build**: Re-evaluates links after Unreal finishes navigation generation.
+1. Place `OmniVolumeNavLink`.
+2. Select **Source Box** and move/resize it over the first navigable region. Source is drawn cyan.
+3. Select **Target Box** and move/resize it over the region it should connect to. Target is drawn orange.
+4. Choose **Direction** using Source/Target terminology.
+5. Choose **Coverage Density**. Balanced is the recommended default.
+6. Check **Status**. A healthy actor reports `Ready` and its generated link count.
 
-### Debug counters
+The normal setup controls are intentionally small:
 
-The Details panel reports:
+- **Enabled**
+- **Direction**: Both Ways, Source to Target, or Target to Source.
+- **Coverage Density**: Sparse, Balanced, Dense, or Custom.
+- **Custom Spacing**: only appears when Coverage Density is Custom.
+- **Max Crossing Distance**: longest connection Omni is allowed to generate. Zero disables the limit.
+
+The **Actions** category provides:
+
+- **Regenerate Links**
+- **Swap Source and Target**
+- **Match Target Size to Source**
+- **Reset Volumes**
+
+Projection, native navigation, safety-cap, and optimization settings remain available under **Advanced**, but should not be necessary for ordinary placement.
+
+### Status and diagnostics
+
+The Status category now reports plain-English feedback such as:
+
+- Ready and generated link count
+- no NavMesh found inside Source Box
+- no NavMesh found inside Target Box
+- volumes exceeding Max Crossing Distance
+- generated-link cap reached
+- grid safety cap reached
+
+Low-level counters remain under **Diagnostics** for troubleshooting.
+
+### Diagnostic counters
+
+When deeper troubleshooting is needed, Diagnostics reports:
 
 - Generated Link Count
 - Source Grid Candidate Count
@@ -70,7 +93,7 @@ Use **Regenerate Links** for an explicit refresh while testing.
 
 ## Important traversal note
 
-Omni 0.3.0 creates navigation connectivity. It does not yet provide a jump, mantle, climb, teleport, or other physical traversal implementation.
+Omni 0.4.0 creates navigation connectivity. It does not yet provide a jump, mantle, climb, teleport, or other physical traversal implementation.
 
 A normal Character can cross links that its movement can physically complete. For example, a small same-height gap may work directly, while a low-to-high connection can be pathfindable but still require a future jump or mantle traversal layer.
 
