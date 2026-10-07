@@ -4,9 +4,9 @@ Omni is an Unreal Engine navigation authoring plugin for creating broad traversa
 
 ## Current development version
 
-**Omni 0.4.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.5.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build is a UX pass over the Volume-to-Volume workflow. Source and Target are color-coded, normal setup is reduced to a few designer-facing controls, technical settings are moved behind Advanced, and plain-English status feedback explains why coverage is or is not being generated.
+This development build adds explicit pairing behavior and live authoring visualization. **Nearest** remains the default general-purpose solver. **Matched Grid** attempts one-to-one correspondence between normalized Source and Target grid positions. When the actor is selected, Omni previews valid Source samples, valid Target samples, and the actual generated pairings directly in the viewport.
 
 ## Omni Volume NavLink
 
@@ -18,11 +18,12 @@ Omni:
 2. Builds a grid of candidate points across each volume using the selected **Coverage Density**.
 3. Projects every grid point to Unreal navigation data.
 4. Rejects projections that fail, move too far, or leave their authoring volume.
-5. Pairs every valid Source sample with its nearest valid Target sample.
-6. Performs the reverse Target-to-Source pairing so differently sized volumes retain coverage on both sides.
-7. Rejects links beyond **Max Crossing Distance**.
-8. Deduplicates nearly identical endpoint pairs.
-9. Publishes the surviving connections as ordinary native `FNavigationLink` entries through a `UNavLinkComponent`.
+5. Pairs valid samples according to **Pairing Mode**.
+   - **Nearest** pairs samples by nearest projected world position from both sides, then deduplicates the result.
+   - **Matched Grid** pairs normalized local grid positions one-to-one. If an exact corresponding sample is unavailable, it uses the nearest unused valid normalized sample as a local fallback.
+6. Rejects links beyond **Max Crossing Distance**.
+7. Deduplicates nearly identical endpoint pairs.
+8. Publishes the surviving connections as ordinary native `FNavigationLink` entries through a `UNavLinkComponent`.
 
 The generated links are internal data. Omni does not spawn generated NavLinkProxy actors in the Outliner.
 
@@ -36,16 +37,21 @@ The useful navigation surface is normally the NavMesh under the volume, so Omni 
 2. Select **Source Box** and move/resize it over the first navigable region. Source is drawn cyan.
 3. Select **Target Box** and move/resize it over the region it should connect to. Target is drawn orange.
 4. Choose **Direction** using Source/Target terminology.
-5. Choose **Coverage Density**. Balanced is the recommended default.
-6. Check **Status**. A healthy actor reports `Ready` and its generated link count.
+5. Choose **Pairing Mode**. Nearest is the recommended default.
+6. Choose **Coverage Density**. Balanced is the recommended default.
+7. Check **Status**. A healthy actor reports `Ready`, the pairing mode, and its generated link count.
+8. Keep **Show Preview** enabled while authoring to see valid sample points and the actual generated pairings when the actor is selected.
 
 The normal setup controls are intentionally small:
 
 - **Enabled**
 - **Direction**: Both Ways, Source to Target, or Target to Source.
+- **Pairing Mode**: Nearest or Matched Grid.
 - **Coverage Density**: Sparse, Balanced, Dense, or Custom.
 - **Custom Spacing**: only appears when Coverage Density is Custom.
 - **Max Crossing Distance**: longest connection Omni is allowed to generate. Zero disables the limit.
+
+The **Visualization** category contains **Show Preview**. With the actor selected, cyan points are valid Source NavMesh samples, orange points are valid Target NavMesh samples, and green lines are the actual generated native link pairings.
 
 The **Actions** category provides:
 
@@ -89,11 +95,11 @@ Use **Regenerate Links** for an explicit refresh while testing.
 
 ## Phase 0 test actor
 
-`OmniTestNavLink` remains included for development comparison. It creates a fixed number of evenly distributed native links between two boxes and was used to prove that normal Unreal pathfinding consumes Omni-generated `FNavigationLink` data.
+`OmniTestNavLink` remains in the plugin only as an internal development baseline so existing test maps can still load it. It is now **NotPlaceable**, so it no longer appears as a normal actor designers can place. New authoring should use `OmniVolumeNavLink`.
 
 ## Important traversal note
 
-Omni 0.4.0 creates navigation connectivity. It does not yet provide a jump, mantle, climb, teleport, or other physical traversal implementation.
+Omni 0.5.0 creates navigation connectivity. It does not yet provide a jump, mantle, climb, teleport, or other physical traversal implementation.
 
 A normal Character can cross links that its movement can physically complete. For example, a small same-height gap may work directly, while a low-to-high connection can be pathfindable but still require a future jump or mantle traversal layer.
 

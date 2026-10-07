@@ -8,6 +8,11 @@
 #include "NavigationSystem.h"
 #include "NavLinkComponent.h"
 
+#if WITH_EDITOR
+#include "DrawDebugHelpers.h"
+#include "Engine/World.h"
+#endif
+
 namespace OmniVolumeNavLinkPrivate
 {
     constexpr float LinkComparisonTolerance = 0.1f;
@@ -15,7 +20,12 @@ namespace OmniVolumeNavLinkPrivate
 
 AOmniVolumeNavLink::AOmniVolumeNavLink()
 {
+#if WITH_EDITOR
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bStartWithTickEnabled = true;
+#else
     PrimaryActorTick.bCanEverTick = false;
+#endif
 
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SetRootComponent(SceneRoot);
@@ -75,6 +85,22 @@ void AOmniVolumeNavLink::PostUnregisterAllComponents()
     Super::PostUnregisterAllComponents();
 }
 
+void AOmniVolumeNavLink::Tick(float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+
+#if WITH_EDITOR
+    DrawEditorPreview();
+#endif
+}
+
+#if WITH_EDITOR
+bool AOmniVolumeNavLink::ShouldTickIfViewportsOnly() const
+{
+    return true;
+}
+#endif
+
 void AOmniVolumeNavLink::RegenerateLinks()
 {
     if (bIsRegenerating || !GeneratedLinks || !SourceBox || !TargetBox)
@@ -104,7 +130,15 @@ void AOmniVolumeNavLink::RegenerateLinks()
         {
             TArray<FProjectedPair> CandidatePairs;
             CandidatePairs.Reserve(SourceSamples.Num() + TargetSamples.Num());
-            BuildNearestPairs(SourceSamples, TargetSamples, CandidatePairs);
+
+            if (PairingMode == EOmniPairingMode::MatchedGrid)
+            {
+                BuildMatchedGridPairs(SourceSamples, TargetSamples, CandidatePairs);
+            }
+            else
+            {
+                BuildNearestPairs(SourceSamples, TargetSamples, CandidatePairs);
+            }
 
             TBitArray<> AttemptedPairs(false, CandidatePairs.Num());
             const int32 SpreadAttemptCount = FMath::Min(SafeMaximumLinks, CandidatePairs.Num());
@@ -297,6 +331,16 @@ bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSour
 
             FProjectedGridSample& NewSample = OutSamples.Emplace_GetRef();
             NewSample.ProjectedWorld = ProjectedWorld;
+            NewSample.GridUV = FVector2D(XAlpha, YAlpha);
+
+            if (bSourceVolume)
+            {
+                PreviewSourceSamples.Add(ProjectedWorld);
+            }
+            else
+            {
+                PreviewTargetSamples.Add(ProjectedWorld);
+            }
         }
     }
 
@@ -395,6 +439,50 @@ void AOmniVolumeNavLink::BuildNearestPairs(const TArray<FProjectedGridSample>& S
     }
 }
 
+void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const
+{
+    OutPairs.Reset();
+
+    if (SourceSamples.IsEmpty() || TargetSamples.IsEmpty())
+    {
+        return;
+    }
+
+    // Matched Grid is intentionally one-to-one. The side with fewer valid NavMesh
+    // samples drives the pairing, and each sample on the other side may be used only
+    // once. Matching happens in normalized local grid coordinates rather than world
+    // space, so correspondence survives different box sizes, offsets, and rotation.
+    const bool bSourceDrives = SourceSamples.Num() <= TargetSamples.Num();
+    const TArray<FProjectedGridSample>& DriverSamples = bSourceDrives ? SourceSamples : TargetSamples;
+    const TArray<FProjectedGridSample>& MatchSamples = bSourceDrives ? TargetSamples : SourceSamples;
+
+    OutPairs.Reserve(DriverSamples.Num());
+    TBitArray<> UsedMatches(false, MatchSamples.Num());
+
+    for (const FProjectedGridSample& DriverSample : DriverSamples)
+    {
+        const int32 MatchIndex = FindNearestUnusedSampleByUV(DriverSample.GridUV, MatchSamples, UsedMatches);
+        if (MatchIndex == INDEX_NONE)
+        {
+            continue;
+        }
+
+        UsedMatches[MatchIndex] = true;
+
+        FProjectedPair& Pair = OutPairs.Emplace_GetRef();
+        if (bSourceDrives)
+        {
+            Pair.SourceWorld = DriverSample.ProjectedWorld;
+            Pair.TargetWorld = MatchSamples[MatchIndex].ProjectedWorld;
+        }
+        else
+        {
+            Pair.SourceWorld = MatchSamples[MatchIndex].ProjectedWorld;
+            Pair.TargetWorld = DriverSample.ProjectedWorld;
+        }
+    }
+}
+
 bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks)
 {
     ++CandidateCount;
@@ -449,6 +537,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     NewLink.SupportedAgents = SupportedAgents;
     NewLink.SetAreaClass(ResolvedAreaClass);
 
+    PreviewGeneratedPairs.Add(Pair);
     return true;
 }
 
@@ -505,6 +594,29 @@ int32 AOmniVolumeNavLink::FindNearestSampleIndex(const FVector& Point, const TAr
     for (int32 Index = 1; Index < Samples.Num(); ++Index)
     {
         const double DistanceSq = FVector::DistSquared(Point, Samples[Index].ProjectedWorld);
+        if (DistanceSq < BestDistanceSq)
+        {
+            BestDistanceSq = DistanceSq;
+            BestIndex = Index;
+        }
+    }
+
+    return BestIndex;
+}
+
+int32 AOmniVolumeNavLink::FindNearestUnusedSampleByUV(const FVector2D& GridUV, const TArray<FProjectedGridSample>& Samples, const TBitArray<>& UsedSamples)
+{
+    int32 BestIndex = INDEX_NONE;
+    double BestDistanceSq = TNumericLimits<double>::Max();
+
+    for (int32 Index = 0; Index < Samples.Num(); ++Index)
+    {
+        if (UsedSamples[Index])
+        {
+            continue;
+        }
+
+        const double DistanceSq = (Samples[Index].GridUV - GridUV).SizeSquared();
         if (DistanceSq < BestDistanceSq)
         {
             BestDistanceSq = DistanceSq;
@@ -582,17 +694,17 @@ void AOmniVolumeNavLink::UpdateGenerationStatus()
     const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
     if (GeneratedLinkCount >= SafeMaximumLinks)
     {
-        GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links. Maximum Generated Links was reached."), GeneratedLinkCount));
+        GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links (%s). Maximum Generated Links was reached."), GeneratedLinkCount, PairingMode == EOmniPairingMode::MatchedGrid ? TEXT("Matched Grid") : TEXT("Nearest")));
         return;
     }
 
     if (bGridSampleCapReached)
     {
-        GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links. Grid sampling was automatically limited by the safety cap."), GeneratedLinkCount));
+        GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links (%s). Grid sampling was automatically limited by the safety cap."), GeneratedLinkCount, PairingMode == EOmniPairingMode::MatchedGrid ? TEXT("Matched Grid") : TEXT("Nearest")));
         return;
     }
 
-    GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links."), GeneratedLinkCount));
+    GenerationStatus = FText::FromString(FString::Printf(TEXT("Ready: %d links (%s)."), GeneratedLinkCount, PairingMode == EOmniPairingMode::MatchedGrid ? TEXT("Matched Grid") : TEXT("Nearest")));
 }
 
 void AOmniVolumeNavLink::ApplyEditorVisualStyle()
@@ -628,7 +740,41 @@ void AOmniVolumeNavLink::ResetDebugCounters()
     RejectedDistanceCount = 0;
     MergedDuplicateCount = 0;
     bGridSampleCapReached = false;
+    PreviewSourceSamples.Reset();
+    PreviewTargetSamples.Reset();
+    PreviewGeneratedPairs.Reset();
 }
+
+#if WITH_EDITOR
+void AOmniVolumeNavLink::DrawEditorPreview() const
+{
+    UWorld* World = GetWorld();
+    if (!bShowPreview || !World || World->WorldType != EWorldType::Editor || !IsSelected())
+    {
+        return;
+    }
+
+    const FVector PreviewOffset(0.0, 0.0, 8.0);
+    const FColor SourceColor(70, 200, 255);
+    const FColor TargetColor(255, 160, 60);
+    const FColor LinkColor(110, 255, 130);
+
+    for (const FVector& Point : PreviewSourceSamples)
+    {
+        DrawDebugPoint(World, Point + PreviewOffset, 10.0f, SourceColor, false, -1.0f, 0);
+    }
+
+    for (const FVector& Point : PreviewTargetSamples)
+    {
+        DrawDebugPoint(World, Point + PreviewOffset, 10.0f, TargetColor, false, -1.0f, 0);
+    }
+
+    for (const FProjectedPair& Pair : PreviewGeneratedPairs)
+    {
+        DrawDebugLine(World, Pair.SourceWorld + PreviewOffset, Pair.TargetWorld + PreviewOffset, LinkColor, false, -1.0f, 0, 1.5f);
+    }
+}
+#endif
 
 void AOmniVolumeNavLink::NotifyNavigationSystem()
 {

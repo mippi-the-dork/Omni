@@ -21,7 +21,14 @@ enum class EOmniVolumeLinkDirection : uint8
     TargetToSource UMETA(DisplayName="Target to Source")
 };
 
-/** Simple authoring presets for grid density. */
+/** How valid samples in Source and Target are paired. */
+UENUM(BlueprintType)
+enum class EOmniPairingMode : uint8
+{
+    Nearest UMETA(DisplayName="Nearest"),
+    MatchedGrid UMETA(DisplayName="Matched Grid")
+};
+
 UENUM(BlueprintType)
 enum class EOmniCoverageDensity : uint8
 {
@@ -38,7 +45,7 @@ enum class EOmniCoverageDensity : uint8
  * 1. Place the actor.
  * 2. Move/resize Source Box over one navigable region.
  * 3. Move/resize Target Box over the region it should connect to.
- * 4. Choose Direction and Coverage Density.
+ * 4. Choose Direction, Pairing Mode, and Coverage Density.
  *
  * Omni projects a horizontal grid inside each volume to NavMesh, pairs valid
  * samples between the two regions, and publishes ordinary FNavigationLink
@@ -55,8 +62,10 @@ public:
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void PostRegisterAllComponents() override;
     virtual void PostUnregisterAllComponents() override;
+    virtual void Tick(float DeltaSeconds) override;
 
 #if WITH_EDITOR
+    virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
     virtual void PostEditMove(bool bFinished) override;
     virtual void PostEditUndo() override;
@@ -87,19 +96,30 @@ public:
     EOmniVolumeLinkDirection LinkDirection = EOmniVolumeLinkDirection::BothWays;
 
     /**
+     * Chooses how valid Source and Target grid samples are paired.
+     * Nearest is the general-purpose default. Matched Grid attempts one-to-one normalized grid correspondence.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Pairing Mode", DisplayPriority="3"))
+    EOmniPairingMode PairingMode = EOmniPairingMode::Nearest;
+
+    /**
      * Controls how densely Omni samples each volume.
      * Sparse = 200 cm, Balanced = 100 cm, Dense = 50 cm.
      */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayPriority="3"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayPriority="4"))
     EOmniCoverageDensity CoverageDensity = EOmniCoverageDensity::Balanced;
 
     /** Used only when Coverage Density is Custom. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Custom Spacing", ClampMin="10.0", UIMin="25.0", UIMax="500.0", Units="cm", EditCondition="CoverageDensity == EOmniCoverageDensity::Custom", EditConditionHides, DisplayPriority="4"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Custom Spacing", ClampMin="10.0", UIMin="25.0", UIMax="500.0", Units="cm", EditCondition="CoverageDensity == EOmniCoverageDensity::Custom", EditConditionHides, DisplayPriority="5"))
     float LinkSpacing = 100.0f;
 
     /** Longest Source-to-Target crossing Omni may create. Zero disables this limit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Max Crossing Distance", ClampMin="0.0", UIMin="0.0", UIMax="5000.0", Units="cm", DisplayPriority="5"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Max Crossing Distance", ClampMin="0.0", UIMin="0.0", UIMax="5000.0", Units="cm", DisplayPriority="6"))
     float MaximumLinkDistance = 2000.0f;
+
+    /** Draw projected samples and the actual generated pairings while this actor is selected. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Visualization", meta=(DisplayName="Show Preview"))
+    bool bShowPreview = true;
 
     /** Plain-English result of the most recent generation pass. */
     UPROPERTY(VisibleAnywhere, Transient, Category="Omni|Status", meta=(DisplayName="Status"))
@@ -217,6 +237,7 @@ private:
     struct FProjectedGridSample
     {
         FVector ProjectedWorld = FVector::ZeroVector;
+        FVector2D GridUV = FVector2D::ZeroVector;
     };
 
     struct FProjectedPair
@@ -229,10 +250,12 @@ private:
     bool ProjectCandidate(const FVector& CandidateWorld, const UBoxComponent& OwnerBox, FVector& OutProjectedWorld, bool& bOutOutsideVolume) const;
     bool IsProjectedPointInsideBox(const FVector& WorldPoint, const UBoxComponent& Box) const;
     void BuildNearestPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
+    void BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
     bool AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks);
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     static int32 CalculateAxisSampleCount(double WorldLength, double Spacing);
     static int32 FindNearestSampleIndex(const FVector& Point, const TArray<FProjectedGridSample>& Samples);
+    static int32 FindNearestUnusedSampleByUV(const FVector2D& GridUV, const TArray<FProjectedGridSample>& Samples, const TBitArray<>& UsedSamples);
     float GetEffectiveLinkSpacing() const;
     ENavLinkDirection::Type GetNativeDirection() const;
     void UpdateGenerationStatus();
@@ -242,8 +265,16 @@ private:
     void BindNavigationGenerationDelegate();
     void UnbindNavigationGenerationDelegate();
 
+#if WITH_EDITOR
+    void DrawEditorPreview() const;
+#endif
+
     UFUNCTION()
     void HandleNavigationGenerationFinished(ANavigationData* NavData);
+
+    TArray<FVector> PreviewSourceSamples;
+    TArray<FVector> PreviewTargetSamples;
+    TArray<FProjectedPair> PreviewGeneratedPairs;
 
     bool bIsRegenerating = false;
 };

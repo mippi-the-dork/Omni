@@ -17,7 +17,7 @@ class USceneComponent;
  * connections between corresponding positions across those boxes and supplies
  * them through a native UNavLinkComponent.
  */
-UCLASS(Blueprintable)
+UCLASS(Blueprintable, NotPlaceable)
 class OMNI_API AOmniTestNavLink : public AActor
 {
     GENERATED_BODY()
