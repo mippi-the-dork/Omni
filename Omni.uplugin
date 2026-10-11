@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 6,
-  "VersionName": "0.5.0",
+  "Version": 16,
+  "VersionName": "0.15.0",
   "FriendlyName": "Omni",
-  "Description": "Volume-to-volume navigation link authoring with Nearest and Matched Grid pairing, live previews, and generated native Unreal navigation links.",
+  "Description": "Enhanced point-to-point, volume-to-volume, and spline-to-spline navigation link authoring with Native, Jump, Automatic, and Blueprint/C++ Custom traversal, shared validation, path costs, height-aware filtering, and configurable live previews.",
   "Category": "AI",
   "CreatedBy": "Mippi the Dork",
   "EngineVersion": "5.8.0",
