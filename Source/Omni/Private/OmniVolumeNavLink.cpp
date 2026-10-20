@@ -1,8 +1,10 @@
 #include "OmniVolumeNavLink.h"
 
 #include "OmniJumpTraversalComponent.h"
+#include "OmniMantleTraversalComponent.h"
 #include "OmniCustomTraversalComponent.h"
 #include "OmniNavArea_Jump.h"
+#include "OmniNavArea_Mantle.h"
 #include "OmniTraversalUtils.h"
 #include "OmniPreviewUtils.h"
 
@@ -63,10 +65,12 @@ AOmniVolumeNavLink::AOmniVolumeNavLink()
     GeneratedLinks->SetGenerateOverlapEvents(false);
 
     JumpTraversal = CreateDefaultSubobject<UOmniJumpTraversalComponent>(TEXT("JumpTraversal"));
+    MantleTraversal = CreateDefaultSubobject<UOmniMantleTraversalComponent>(TEXT("MantleTraversal"));
     CustomTraversal = CreateDefaultSubobject<UOmniCustomTraversalComponent>(TEXT("CustomTraversal"));
 
     AreaClass = UNavArea_Default::StaticClass();
     JumpAreaClass = UOmniNavArea_Jump::StaticClass();
+    MantleAreaClass = UOmniNavArea_Mantle::StaticClass();
     SupportedAgents = FNavAgentSelector(FNavAgentSelector::AllAgentsMask);
     GenerationStatus = FText::FromString(TEXT("Place Source and Target over navigable regions."));
 }
@@ -122,6 +126,7 @@ void AOmniVolumeNavLink::RegenerateLinks()
 
     TArray<FNavigationLink> NewLinks;
     TArray<FOmniJumpLinkSpec> NewJumpLinks;
+    TArray<FOmniMantleLinkSpec> NewMantleLinks;
     TArray<FOmniCustomLinkSpec> NewCustomLinks;
 
     if (bEnabled)
@@ -129,6 +134,7 @@ void AOmniVolumeNavLink::RegenerateLinks()
         const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
         NewLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
         NewJumpLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
+        NewMantleLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
         NewCustomLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
 
         TArray<FProjectedGridSample> SourceSamples;
@@ -153,9 +159,9 @@ void AOmniVolumeNavLink::RegenerateLinks()
                 BuildNearestPairs(SourceSamples, TargetSamples, CandidatePairs);
             }
 
-            auto GeneratedCount = [&NewLinks, &NewJumpLinks, &NewCustomLinks]()
+            auto GeneratedCount = [&NewLinks, &NewJumpLinks, &NewMantleLinks, &NewCustomLinks]()
             {
-                return NewLinks.Num() + NewJumpLinks.Num() + NewCustomLinks.Num();
+                return NewLinks.Num() + NewJumpLinks.Num() + NewMantleLinks.Num() + NewCustomLinks.Num();
             };
 
             TBitArray<> AttemptedPairs(false, CandidatePairs.Num());
@@ -169,14 +175,14 @@ void AOmniVolumeNavLink::RegenerateLinks()
                         / static_cast<double>(SpreadAttemptCount - 1));
 
                 AttemptedPairs[PairIndex] = true;
-                AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewCustomLinks);
+                AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks);
             }
 
             for (int32 PairIndex = 0; PairIndex < CandidatePairs.Num() && GeneratedCount() < SafeMaximumLinks; ++PairIndex)
             {
                 if (!AttemptedPairs[PairIndex])
                 {
-                    AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewCustomLinks);
+                    AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks);
                 }
             }
         }
@@ -184,8 +190,9 @@ void AOmniVolumeNavLink::RegenerateLinks()
 
     NativeLinkCount = NewLinks.Num();
     JumpLinkCount = NewJumpLinks.Num();
+    MantleLinkCount = NewMantleLinks.Num();
     CustomLinkCount = NewCustomLinks.Num();
-    GeneratedLinkCount = NativeLinkCount + JumpLinkCount + CustomLinkCount;
+    GeneratedLinkCount = NativeLinkCount + JumpLinkCount + MantleLinkCount + CustomLinkCount;
     UpdateGenerationStatus();
 
     if (JumpTraversal)
@@ -197,6 +204,18 @@ void AOmniVolumeNavLink::RegenerateLinks()
         else
         {
             JumpTraversal->ClearLinks();
+        }
+    }
+
+    if (MantleTraversal)
+    {
+        if (bEnabled && !NewMantleLinks.IsEmpty())
+        {
+            MantleTraversal->RebuildLinks(NewMantleLinks, SupportedAgents, MantleAreaClass, MantleDuration, MantleArcHeight, MantleLandingTolerance, MantleTraversalTimeout);
+        }
+        else
+        {
+            MantleTraversal->ClearLinks();
         }
     }
 
@@ -525,12 +544,12 @@ void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample
     }
 }
 
-bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks)
+bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks)
 {
     ++CandidateCount;
 
     const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
-    if (InOutLinks.Num() + InOutJumpLinks.Num() + InOutCustomLinks.Num() >= SafeMaximumLinks)
+    if (InOutLinks.Num() + InOutJumpLinks.Num() + InOutMantleLinks.Num() + InOutCustomLinks.Num() >= SafeMaximumLinks)
     {
         return false;
     }
@@ -579,9 +598,9 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
 
     const FTransform LinkTransform = GeneratedLinks->GetComponentTransform();
 
-    auto EmitRawLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseCustom) -> bool
+    auto EmitRawLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
     {
-        if (InOutLinks.Num() + InOutJumpLinks.Num() + InOutCustomLinks.Num() >= SafeMaximumLinks)
+        if (InOutLinks.Num() + InOutJumpLinks.Num() + InOutMantleLinks.Num() + InOutCustomLinks.Num() >= SafeMaximumLinks)
         {
             return false;
         }
@@ -592,6 +611,19 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
             CustomSpec.SourceWorld = Pair.SourceWorld;
             CustomSpec.TargetWorld = Pair.TargetWorld;
             CustomSpec.Direction = Direction;
+            CustomSpec.SourceToTargetTraversalId = bUseDirectionalTraversalActions
+                ? SourceToTargetCustomTraversalId
+                : CustomTraversalId;
+            CustomSpec.TargetToSourceTraversalId = bUseDirectionalTraversalActions
+                ? TargetToSourceCustomTraversalId
+                : CustomTraversalId;
+        }
+        else if (bUseMantle)
+        {
+            FOmniMantleLinkSpec& MantleSpec = InOutMantleLinks.Emplace_GetRef();
+            MantleSpec.SourceWorld = Pair.SourceWorld;
+            MantleSpec.TargetWorld = Pair.TargetWorld;
+            MantleSpec.Direction = Direction;
         }
         else if (bUseJump)
         {
@@ -619,6 +651,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         FProjectedPair PreviewPair = Pair;
         PreviewPair.NativeDirection = Direction;
         PreviewPair.bUsesJumpTraversal = bUseJump;
+        PreviewPair.bUsesMantleTraversal = bUseMantle;
         PreviewPair.bUsesCustomTraversal = bUseCustom;
         PreviewGeneratedPairs.Add(PreviewPair);
         return true;
@@ -638,6 +671,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         FProjectedPair PreviewPair = Pair;
         PreviewPair.NativeDirection = Direction;
         PreviewPair.bUsesJumpTraversal = true;
+        PreviewPair.bUsesMantleTraversal = false;
         PreviewPair.bUsesCustomTraversal = false;
         PreviewRejectedJumpPairs.Add(PreviewPair);
     };
@@ -657,16 +691,78 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return false;
     };
 
-    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseCustom) -> bool
+    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction)
+    {
+        ++RejectedMantlePathCount;
+
+        FProjectedPair PreviewPair = Pair;
+        PreviewPair.NativeDirection = Direction;
+        PreviewPair.bUsesJumpTraversal = false;
+        PreviewPair.bUsesMantleTraversal = true;
+        PreviewPair.bUsesCustomTraversal = false;
+        PreviewRejectedMantlePairs.Add(PreviewPair);
+    };
+
+    auto ValidateMantleDirection = [&](ENavLinkDirection::Type Direction) -> bool
+    {
+        const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
+        const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
+        if (IsMantleDirectionValid(StartWorld, EndWorld))
+        {
+            return true;
+        }
+
+        RecordRejectedMantle(Direction);
+        return false;
+    };
+
+    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
     {
         if (bUseCustom)
         {
-            return EmitRawLink(Direction, false, true);
+            return EmitRawLink(Direction, false, false, true);
+        }
+
+        if (bUseMantle)
+        {
+            if (!bValidateMantlePath)
+            {
+                return EmitRawLink(Direction, false, true, false);
+            }
+
+            if (Direction == ENavLinkDirection::BothWays)
+            {
+                const bool bForwardValid = ValidateMantleDirection(ENavLinkDirection::LeftToRight);
+                const bool bReverseValid = ValidateMantleDirection(ENavLinkDirection::RightToLeft);
+
+                if (bForwardValid && bReverseValid)
+                {
+                    return EmitRawLink(ENavLinkDirection::BothWays, false, true, false);
+                }
+                if (bForwardValid)
+                {
+                    ++MantleRestrictedToOneWayCount;
+                    return EmitRawLink(ENavLinkDirection::LeftToRight, false, true, false);
+                }
+                if (bReverseValid)
+                {
+                    ++MantleRestrictedToOneWayCount;
+                    return EmitRawLink(ENavLinkDirection::RightToLeft, false, true, false);
+                }
+                return false;
+            }
+
+            if (!ValidateMantleDirection(Direction))
+            {
+                return false;
+            }
+
+            return EmitRawLink(Direction, false, true, false);
         }
 
         if (!bUseJump || !bValidateJumpPath)
         {
-            return EmitRawLink(Direction, bUseJump, false);
+            return EmitRawLink(Direction, bUseJump, false, false);
         }
 
         if (Direction == ENavLinkDirection::BothWays)
@@ -676,17 +772,17 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
 
             if (bForwardValid && bReverseValid)
             {
-                return EmitRawLink(ENavLinkDirection::BothWays, true, false);
+                return EmitRawLink(ENavLinkDirection::BothWays, true, false, false);
             }
             if (bForwardValid)
             {
                 ++JumpRestrictedToOneWayCount;
-                return EmitRawLink(ENavLinkDirection::LeftToRight, true, false);
+                return EmitRawLink(ENavLinkDirection::LeftToRight, true, false, false);
             }
             if (bReverseValid)
             {
                 ++JumpRestrictedToOneWayCount;
-                return EmitRawLink(ENavLinkDirection::RightToLeft, true, false);
+                return EmitRawLink(ENavLinkDirection::RightToLeft, true, false, false);
             }
             return false;
         }
@@ -696,7 +792,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
             return false;
         }
 
-        return EmitRawLink(Direction, true, false);
+        return EmitRawLink(Direction, true, false, false);
     };
 
     FOmniAutomaticTraversalSettings AutomaticSettings;
@@ -709,21 +805,53 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     AutomaticSettings.MaxGroundSlopeDegrees = AutomaticMaxGroundSlopeDegrees;
     AutomaticSettings.AgentRadius = JumpValidationAgentRadius;
     AutomaticSettings.AgentHalfHeight = JumpValidationAgentHalfHeight;
+    AutomaticSettings.bAllowAutomaticMantle = bAutomaticUseMantle;
+    AutomaticSettings.bRequireMantleLedge = bAutomaticRequireMantleLedge;
+    AutomaticSettings.MantleMaxHeight = AutomaticMantleMaxHeight;
+    AutomaticSettings.MantleMaxReach = AutomaticMantleMaxReach;
+    AutomaticSettings.bValidateMantlePath = bValidateMantlePath;
+    AutomaticSettings.MantleArcHeight = MantleArcHeight;
+    AutomaticSettings.MantleValidationSegments = MantleValidationSegments;
 
-    const FOmniTraversalPlan TraversalPlan = OmniTraversal::BuildTraversalPlan(
+    const FOmniTraversalPlan TraversalPlan = OmniTraversal::BuildDirectionalTraversalPlan(
         GetWorld(),
         this,
         Pair.SourceWorld,
         Pair.TargetWorld,
         PairDirection,
         TraversalAction,
+        bUseDirectionalTraversalActions,
+        SourceToTargetTraversalAction,
+        TargetToSourceTraversalAction,
         AutomaticSettings);
 
-    if (TraversalAction == EOmniTraversalAction::Automatic && bValidateAutomaticNativePath)
+    if (UsesTraversalAction(EOmniTraversalAction::Automatic))
     {
-        auto RecordAutomaticDiagnostic = [&](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
+        auto RecordAutomaticDiagnostic = [&](const FOmniAutomaticDirectionDiagnostic& Diagnostic, ENavLinkDirection::Type Direction)
         {
-            if (!Diagnostic.bEvaluated || !Diagnostic.bUseJump)
+            if (!Diagnostic.bEvaluated)
+            {
+                return;
+            }
+
+            if (Diagnostic.bMantleValidationFallback)
+            {
+                ++AutomaticMantleValidationFallbackCount;
+                RecordRejectedMantle(Direction);
+            }
+
+            if (Diagnostic.bMantleLedgeFallback)
+            {
+                ++AutomaticMantleLedgeFallbackCount;
+            }
+
+            if (Diagnostic.bUseMantle)
+            {
+                ++AutomaticMantlePromotionCount;
+                return;
+            }
+
+            if (!Diagnostic.bUseJump)
             {
                 return;
             }
@@ -744,8 +872,8 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
             }
         };
 
-        RecordAutomaticDiagnostic(TraversalPlan.SourceToTargetAutomatic);
-        RecordAutomaticDiagnostic(TraversalPlan.TargetToSourceAutomatic);
+        RecordAutomaticDiagnostic(TraversalPlan.SourceToTargetAutomatic, ENavLinkDirection::LeftToRight);
+        RecordAutomaticDiagnostic(TraversalPlan.TargetToSourceAutomatic, ENavLinkDirection::RightToLeft);
     }
 
     bool bAnyAdded = false;
@@ -753,7 +881,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     for (int32 LegIndex = 0; LegIndex < TraversalPlan.LegCount; ++LegIndex)
     {
         const FOmniTraversalLeg& Leg = TraversalPlan.Legs[LegIndex];
-        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseCustom);
+        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom);
         bAnyAdded |= bAdded;
         AddedLegCount += bAdded ? 1 : 0;
     }
@@ -761,6 +889,11 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     if (TraversalPlan.bAutomaticSplit && AddedLegCount == TraversalPlan.LegCount)
     {
         ++AutomaticSplitPairCount;
+    }
+
+    if (TraversalPlan.bDirectionalSplit && AddedLegCount == TraversalPlan.LegCount)
+    {
+        ++DirectionalSplitPairCount;
     }
 
     return bAnyAdded;
@@ -964,6 +1097,18 @@ bool AOmniVolumeNavLink::IsJumpDirectionValid(const FVector& StartWorld, const F
     return false;
 }
 
+bool AOmniVolumeNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld) const
+{
+    FOmniMantleValidationSettings Settings;
+    Settings.bValidatePath = bValidateMantlePath;
+    Settings.ArcHeight = MantleArcHeight;
+    Settings.AgentRadius = JumpValidationAgentRadius;
+    Settings.AgentHalfHeight = JumpValidationAgentHalfHeight;
+    Settings.PathSegments = MantleValidationSegments;
+
+    return OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings) == EOmniMantleValidationResult::Valid;
+}
+
 float AOmniVolumeNavLink::GetEffectiveLinkSpacing() const
 {
     switch (CoverageDensity)
@@ -992,6 +1137,17 @@ ENavLinkDirection::Type AOmniVolumeNavLink::GetNativeDirection() const
     default:
         return ENavLinkDirection::BothWays;
     }
+}
+
+bool AOmniVolumeNavLink::UsesTraversalAction(EOmniTraversalAction Action) const
+{
+    if (!bUseDirectionalTraversalActions)
+    {
+        return TraversalAction == Action;
+    }
+
+    return SourceToTargetTraversalAction == Action
+        || TargetToSourceTraversalAction == Action;
 }
 
 void AOmniVolumeNavLink::UpdateGenerationStatus()
@@ -1037,9 +1193,82 @@ void AOmniVolumeNavLink::UpdateGenerationStatus()
 
     FString Status = FString::Printf(TEXT("Ready: %d links (%s)."), GeneratedLinkCount, PairingMode == EOmniPairingMode::MatchedGrid ? TEXT("Matched Grid") : TEXT("Nearest"));
 
-    if (TraversalAction == EOmniTraversalAction::Jump)
+    if (bUseDirectionalTraversalActions)
+    {
+        Status += FString::Printf(
+            TEXT(" Directional traversal: %d native, %d jump, %d mantle, %d custom."),
+            NativeLinkCount,
+            JumpLinkCount,
+            MantleLinkCount,
+            CustomLinkCount);
+
+        if (DirectionalSplitPairCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" %d pair%s split by explicit directional actions."),
+                DirectionalSplitPairCount,
+                DirectionalSplitPairCount == 1 ? TEXT(" was") : TEXT("s were"));
+        }
+
+        if (AutomaticSplitPairCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" %d pair%s split by Automatic traversal."),
+                AutomaticSplitPairCount,
+                AutomaticSplitPairCount == 1 ? TEXT(" was") : TEXT("s were"));
+        }
+
+        if (CustomLinkCount > 0)
+        {
+            Status += TEXT(" Bind CustomTraversal.OnTraversalRequested and call Complete Custom Traversal when custom movement is finished.");
+        }
+
+        if (UsesTraversalAction(EOmniTraversalAction::Automatic) && AutomaticMantlePromotionCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" Automatic selected Mantle for %d short upward direction%s."),
+                AutomaticMantlePromotionCount,
+                AutomaticMantlePromotionCount == 1 ? TEXT("") : TEXT("s"));
+        }
+
+        if (UsesTraversalAction(EOmniTraversalAction::Automatic) && AutomaticMantleValidationFallbackCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" Mantle validation redirected %d Automatic direction%s to Jump."),
+                AutomaticMantleValidationFallbackCount,
+                AutomaticMantleValidationFallbackCount == 1 ? TEXT("") : TEXT("s"));
+        }
+
+        if (UsesTraversalAction(EOmniTraversalAction::Automatic) && AutomaticMantleLedgeFallbackCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" Ledge detection redirected %d Automatic direction%s to Jump because no usable mantle ledge geometry was found."),
+                AutomaticMantleLedgeFallbackCount,
+                AutomaticMantleLedgeFallbackCount == 1 ? TEXT("") : TEXT("s"));
+        }
+
+        if (UsesTraversalAction(EOmniTraversalAction::Automatic) && bValidateAutomaticNativePath)
+        {
+            const int32 NativeValidationPromotions = AutomaticStepPromotionCount + AutomaticSlopePromotionCount + AutomaticBlockedPromotionCount;
+            if (NativeValidationPromotions > 0)
+            {
+                Status += FString::Printf(
+                    TEXT(" Native validation promoted %d direction%s to Jump (step %d, slope %d, clearance %d)."),
+                    NativeValidationPromotions,
+                    NativeValidationPromotions == 1 ? TEXT("") : TEXT("s"),
+                    AutomaticStepPromotionCount,
+                    AutomaticSlopePromotionCount,
+                    AutomaticBlockedPromotionCount);
+            }
+        }
+    }
+    else if (TraversalAction == EOmniTraversalAction::Jump)
     {
         Status += FString::Printf(TEXT(" Jump traversal: %d smart link%s, apex %.0f cm."), JumpLinkCount, JumpLinkCount == 1 ? TEXT("") : TEXT("s"), JumpApexHeight);
+    }
+    else if (TraversalAction == EOmniTraversalAction::Mantle)
+    {
+        Status += FString::Printf(TEXT(" Mantle traversal: %d smart link%s, duration %.2f s, arc %.0f cm."), MantleLinkCount, MantleLinkCount == 1 ? TEXT("") : TEXT("s"), MantleDuration, MantleArcHeight);
     }
     else if (TraversalAction == EOmniTraversalAction::Custom)
     {
@@ -1047,10 +1276,34 @@ void AOmniVolumeNavLink::UpdateGenerationStatus()
     }
     else if (TraversalAction == EOmniTraversalAction::Automatic)
     {
-        Status += FString::Printf(TEXT(" Automatic traversal: %d native, %d jump."), NativeLinkCount, JumpLinkCount);
+        Status += FString::Printf(TEXT(" Automatic traversal: %d native, %d mantle, %d jump."), NativeLinkCount, MantleLinkCount, JumpLinkCount);
         if (AutomaticSplitPairCount > 0)
         {
             Status += FString::Printf(TEXT(" %d bidirectional pair%s split by traversal type."), AutomaticSplitPairCount, AutomaticSplitPairCount == 1 ? TEXT(" was") : TEXT("s were"));
+        }
+
+        if (AutomaticMantlePromotionCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" Automatic selected Mantle for %d short upward direction%s."),
+                AutomaticMantlePromotionCount,
+                AutomaticMantlePromotionCount == 1 ? TEXT("") : TEXT("s"));
+        }
+
+        if (AutomaticMantleValidationFallbackCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" Mantle validation redirected %d Automatic direction%s to Jump."),
+                AutomaticMantleValidationFallbackCount,
+                AutomaticMantleValidationFallbackCount == 1 ? TEXT("") : TEXT("s"));
+        }
+
+        if (AutomaticMantleLedgeFallbackCount > 0)
+        {
+            Status += FString::Printf(
+                TEXT(" Ledge detection redirected %d Automatic direction%s to Jump because no usable mantle ledge geometry was found."),
+                AutomaticMantleLedgeFallbackCount,
+                AutomaticMantleLedgeFallbackCount == 1 ? TEXT("") : TEXT("s"));
         }
 
         if (bValidateAutomaticNativePath)
@@ -1069,7 +1322,7 @@ void AOmniVolumeNavLink::UpdateGenerationStatus()
         }
     }
 
-    if (bValidateJumpPath && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic))
+    if (bValidateJumpPath && (UsesTraversalAction(EOmniTraversalAction::Jump) || UsesTraversalAction(EOmniTraversalAction::Automatic)))
     {
         const int32 RejectedJumpDirections = RejectedJumpArcCount + RejectedJumpSpeedCount;
         if (RejectedJumpDirections > 0)
@@ -1079,6 +1332,18 @@ void AOmniVolumeNavLink::UpdateGenerationStatus()
         if (JumpRestrictedToOneWayCount > 0)
         {
             Status += FString::Printf(TEXT(" %d bidirectional jump pair%s reduced to one-way by validation."), JumpRestrictedToOneWayCount, JumpRestrictedToOneWayCount == 1 ? TEXT(" was") : TEXT("s were"));
+        }
+    }
+
+    if (bValidateMantlePath && (UsesTraversalAction(EOmniTraversalAction::Mantle) || UsesTraversalAction(EOmniTraversalAction::Automatic)))
+    {
+        if (RejectedMantlePathCount > 0)
+        {
+            Status += FString::Printf(TEXT(" %d mantle direction%s rejected by path validation."), RejectedMantlePathCount, RejectedMantlePathCount == 1 ? TEXT(" was") : TEXT("s were"));
+        }
+        if (MantleRestrictedToOneWayCount > 0)
+        {
+            Status += FString::Printf(TEXT(" %d bidirectional mantle pair%s reduced to one-way by validation."), MantleRestrictedToOneWayCount, MantleRestrictedToOneWayCount == 1 ? TEXT(" was") : TEXT("s were"));
         }
     }
 
@@ -1129,6 +1394,7 @@ void AOmniVolumeNavLink::ResetDebugCounters()
     GeneratedLinkCount = 0;
     NativeLinkCount = 0;
     JumpLinkCount = 0;
+    MantleLinkCount = 0;
     CustomLinkCount = 0;
     SourceGridCandidateCount = 0;
     TargetGridCandidateCount = 0;
@@ -1141,18 +1407,25 @@ void AOmniVolumeNavLink::ResetDebugCounters()
     RejectedDistanceCount = 0;
     HeightRestrictedLinkCount = 0;
     AutomaticSplitPairCount = 0;
+    DirectionalSplitPairCount = 0;
     AutomaticStepPromotionCount = 0;
     AutomaticSlopePromotionCount = 0;
     AutomaticBlockedPromotionCount = 0;
+    AutomaticMantlePromotionCount = 0;
+    AutomaticMantleValidationFallbackCount = 0;
+    AutomaticMantleLedgeFallbackCount = 0;
     RejectedJumpArcCount = 0;
     RejectedJumpSpeedCount = 0;
     JumpRestrictedToOneWayCount = 0;
+    RejectedMantlePathCount = 0;
+    MantleRestrictedToOneWayCount = 0;
     MergedDuplicateCount = 0;
     bGridSampleCapReached = false;
     PreviewSourceSamples.Reset();
     PreviewTargetSamples.Reset();
     PreviewGeneratedPairs.Reset();
     PreviewRejectedJumpPairs.Reset();
+    PreviewRejectedMantlePairs.Reset();
 }
 
 #if WITH_EDITOR
@@ -1187,6 +1460,10 @@ void AOmniVolumeNavLink::DrawEditorPreview() const
         {
             OmniPreview::DrawCustomTraversal(World, Pair.SourceWorld, Pair.TargetWorld, Pair.NativeDirection, 1.5f, PreviewOffset);
         }
+        else if (Pair.bUsesMantleTraversal)
+        {
+            OmniPreview::DrawMantleTraversal(World, Pair.SourceWorld, Pair.TargetWorld, Pair.NativeDirection, MantleArcHeight, MantleValidationSegments, 1.5f, PreviewOffset);
+        }
         else
         {
             OmniPreview::DrawTraversal(
@@ -1215,6 +1492,20 @@ void AOmniVolumeNavLink::DrawEditorPreview() const
                 true,
                 JumpApexHeight,
                 JumpValidationSegments,
+                2.0f,
+                PreviewOffset,
+                &RejectedColor);
+        }
+
+        for (const FProjectedPair& Pair : PreviewRejectedMantlePairs)
+        {
+            OmniPreview::DrawMantleTraversal(
+                World,
+                Pair.SourceWorld,
+                Pair.TargetWorld,
+                Pair.NativeDirection,
+                MantleArcHeight,
+                MantleValidationSegments,
                 2.0f,
                 PreviewOffset,
                 &RejectedColor);
@@ -1279,7 +1570,21 @@ void AOmniVolumeNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
     ApplyEditorVisualStyle();
 
     const FName PropertyName = PropertyChangedEvent.Property ? PropertyChangedEvent.Property->GetFName() : NAME_None;
+    const FName DirectionalActionsName = GET_MEMBER_NAME_CHECKED(AOmniVolumeNavLink, bUseDirectionalTraversalActions);
     const FName AutoRegenerateName = GET_MEMBER_NAME_CHECKED(AOmniVolumeNavLink, bAutoRegenerate);
+
+    if (PropertyName == DirectionalActionsName && bUseDirectionalTraversalActions)
+    {
+        // Enabling directional actions should preserve the actor's current behavior
+        // until the designer intentionally changes one of the two directions.
+        SourceToTargetTraversalAction = TraversalAction;
+        TargetToSourceTraversalAction = TraversalAction;
+        if (TraversalAction == EOmniTraversalAction::Custom)
+        {
+            SourceToTargetCustomTraversalId = CustomTraversalId;
+            TargetToSourceCustomTraversalId = CustomTraversalId;
+        }
+    }
 
     if (bAutoRegenerate || PropertyName == AutoRegenerateName)
     {

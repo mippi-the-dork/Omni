@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 16,
-  "VersionName": "0.15.0",
+  "Version": 21,
+  "VersionName": "0.21.0",
   "FriendlyName": "Omni",
-  "Description": "Enhanced point-to-point, volume-to-volume, and spline-to-spline navigation link authoring with Native, Jump, Automatic, and Blueprint/C++ Custom traversal, shared validation, path costs, height-aware filtering, and configurable live previews.",
+  "Description": "Enhanced point, volume, and spline navigation links with Native, Jump, Mantle, Automatic, Custom, directional traversal, generation-time traversal validation, path costs, height-aware filtering, and live previews.",
   "Category": "AI",
   "CreatedBy": "Mippi the Dork",
   "EngineVersion": "5.8.0",

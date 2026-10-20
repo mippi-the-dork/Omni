@@ -120,6 +120,54 @@ namespace OmniPreview
             DrawBallisticArc(World, Target, Source, Color, JumpApexHeight, JumpArcSegments, LineThickness);
         }
     }
+    void DrawMantleTraversal(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        float ArcHeight,
+        int32 PathSegments,
+        float LineThickness,
+        const FVector& Offset,
+        const FColor* OverrideColor)
+    {
+        if (!World)
+        {
+            return;
+        }
+
+        const FVector Source = SourceWorld + Offset;
+        const FVector Target = TargetWorld + Offset;
+        const FColor Color = OverrideColor ? *OverrideColor : DirectionColor(Direction);
+        const int32 SegmentCount = FMath::Clamp(PathSegments, 6, 64);
+
+        auto DrawArc = [&](const FVector& Start, const FVector& End, const FVector& SideOffset)
+        {
+            FVector Previous = Start + SideOffset;
+            for (int32 Segment = 1; Segment <= SegmentCount; ++Segment)
+            {
+                const float Alpha = static_cast<float>(Segment) / static_cast<float>(SegmentCount);
+                FVector Point = OmniTraversal::CalculateMantlePathPoint(Start, End, Alpha, ArcHeight);
+                Point += SideOffset;
+                DrawDebugLine(World, Previous, Point, Color, false, -1.0f, 0, LineThickness);
+                Previous = Point;
+            }
+        };
+
+        if (Direction == ENavLinkDirection::RightToLeft)
+        {
+            DrawArc(Target, Source, FVector::ZeroVector);
+            return;
+        }
+
+        DrawArc(Source, Target, FVector::ZeroVector);
+        if (Direction == ENavLinkDirection::BothWays)
+        {
+            const FVector SideOffset = FVector::CrossProduct((Target - Source).GetSafeNormal(), FVector::UpVector).GetSafeNormal() * 4.0f;
+            DrawArc(Target, Source, SideOffset);
+        }
+    }
+
     void DrawCustomTraversal(
         UWorld* World,
         const FVector& SourceWorld,

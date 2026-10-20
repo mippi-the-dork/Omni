@@ -36,7 +36,7 @@ void UOmniCustomTraversalComponent::RebuildLinks(
     while (CustomLinks.Num() > LinkSpecs.Num())
     {
         UNavLinkCustomComponent* Link = CustomLinks.Last();
-        FinishTraversalsForLink(Link);
+        FinishTraversalsForLink(Link, EOmniCustomTraversalFinishReason::Cancelled);
         CustomLinks.Pop();
 
         if (Link)
@@ -115,7 +115,10 @@ void UOmniCustomTraversalComponent::RebuildLinks(
 
 void UOmniCustomTraversalComponent::ClearLinks()
 {
-    CompleteAllTraversals();
+    for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
+    {
+        FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
+    }
 
     if (AActor* Owner = GetOwner())
     {
@@ -156,30 +159,81 @@ void UOmniCustomTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponen
     {
         if (ActiveTraversals[Index].PathFollowing.Get() == PathFollowing)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
         }
     }
 
     FActiveCustomTraversal& Traversal = ActiveTraversals.Emplace_GetRef();
-    Traversal.RequestId = NextRequestId;
+    Traversal.Request.RequestId = NextRequestId;
     NextRequestId = NextRequestId >= MAX_int32 ? 1 : NextRequestId + 1;
+    Traversal.Request.Pawn = Pawn;
+    Traversal.Request.OmniActor = GetOwner();
+    Traversal.Request.Start = Pawn->GetActorLocation();
+    Traversal.Request.Destination = DestinationPoint;
     Traversal.PathFollowing = PathFollowing;
-    Traversal.Pawn = Pawn;
     Traversal.Link = LinkComp;
-    Traversal.Start = Pawn->GetActorLocation();
-    Traversal.Destination = DestinationPoint;
     Traversal.ElapsedTime = 0.0f;
 
-    SetComponentTickEnabled(true);
-
-    if (OnTraversalRequested.IsBound())
+    const int32 LinkIndex = FindLinkIndex(LinkComp);
+    if (CachedLinkSpecs.IsValidIndex(LinkIndex))
     {
-        OnTraversalRequested.Broadcast(Traversal.RequestId, Pawn, Traversal.Start, DestinationPoint);
+        const FOmniCustomLinkSpec& Spec = CachedLinkSpecs[LinkIndex];
+        Traversal.Request.Source = Spec.SourceWorld;
+        Traversal.Request.Target = Spec.TargetWorld;
+
+        bool bSourceToTarget = true;
+        if (Spec.Direction == ENavLinkDirection::RightToLeft)
+        {
+            bSourceToTarget = false;
+        }
+        else if (Spec.Direction == ENavLinkDirection::BothWays)
+        {
+            const double DistanceToTargetSq = FVector::DistSquared(DestinationPoint, Spec.TargetWorld);
+            const double DistanceToSourceSq = FVector::DistSquared(DestinationPoint, Spec.SourceWorld);
+            bSourceToTarget = DistanceToTargetSq <= DistanceToSourceSq;
+        }
+
+        Traversal.Request.Direction = bSourceToTarget
+            ? EOmniTraversalDirection::SourceToTarget
+            : EOmniTraversalDirection::TargetToSource;
+        Traversal.Request.TraversalId = bSourceToTarget
+            ? Spec.SourceToTargetTraversalId
+            : Spec.TargetToSourceTraversalId;
     }
     else
     {
+        // The link should always have a matching cached spec, but keep a useful fallback
+        // if a project mutates components while a path is already using the actor.
+        Traversal.Request.Source = Traversal.Request.Start;
+        Traversal.Request.Target = DestinationPoint;
+        Traversal.Request.Direction = EOmniTraversalDirection::SourceToTarget;
+        Traversal.Request.TraversalId = NAME_None;
+    }
+
+    SetComponentTickEnabled(true);
+
+    // Copy before broadcasting. A Blueprint listener is allowed to complete the request
+    // synchronously, which can remove the active array entry while delegates are executing.
+    const FOmniCustomTraversalRequest RequestCopy = Traversal.Request;
+    const bool bHasRequestListener = OnTraversalRequestedDetailed.IsBound() || OnTraversalRequested.IsBound();
+    if (OnTraversalRequestedDetailed.IsBound())
+    {
+        OnTraversalRequestedDetailed.Broadcast(RequestCopy);
+    }
+
+    if (OnTraversalRequested.IsBound())
+    {
+        OnTraversalRequested.Broadcast(
+            RequestCopy.RequestId,
+            Pawn,
+            RequestCopy.Start,
+            RequestCopy.Destination);
+    }
+
+    if (!bHasRequestListener)
+    {
         // Never deadlock AI path following just because no Blueprint/C++ listener was bound.
-        FinishTraversalAtIndex(ActiveTraversals.Num() - 1);
+        FinishTraversalAtIndex(ActiveTraversals.Num() - 1, EOmniCustomTraversalFinishReason::NoListener);
     }
 }
 
@@ -192,14 +246,14 @@ void UOmniCustomTraversalComponent::TickComponent(float DeltaTime, ELevelTick Ti
         FActiveCustomTraversal& Traversal = ActiveTraversals[Index];
         if (!Traversal.PathFollowing.IsValid() || !Traversal.Link.IsValid())
         {
-            ActiveTraversals.RemoveAtSwap(Index);
+            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
             continue;
         }
 
         Traversal.ElapsedTime += DeltaTime;
         if (Traversal.ElapsedTime >= TraversalTimeout)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::TimedOut);
         }
     }
 
@@ -213,9 +267,9 @@ void UOmniCustomTraversalComponent::CompleteTraversal(int32 RequestId)
 {
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
     {
-        if (ActiveTraversals[Index].RequestId == RequestId)
+        if (ActiveTraversals[Index].Request.RequestId == RequestId)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Completed);
             return;
         }
     }
@@ -225,7 +279,7 @@ void UOmniCustomTraversalComponent::CompleteAllTraversals()
 {
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
     {
-        FinishTraversalAtIndex(Index);
+        FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Completed);
     }
 }
 
@@ -233,7 +287,7 @@ bool UOmniCustomTraversalComponent::IsTraversalActive(int32 RequestId) const
 {
     for (const FActiveCustomTraversal& Traversal : ActiveTraversals)
     {
-        if (Traversal.RequestId == RequestId)
+        if (Traversal.Request.RequestId == RequestId)
         {
             return true;
         }
@@ -241,7 +295,22 @@ bool UOmniCustomTraversalComponent::IsTraversalActive(int32 RequestId) const
     return false;
 }
 
-void UOmniCustomTraversalComponent::FinishTraversalAtIndex(int32 Index)
+bool UOmniCustomTraversalComponent::GetTraversalRequest(int32 RequestId, FOmniCustomTraversalRequest& OutRequest) const
+{
+    for (const FActiveCustomTraversal& Traversal : ActiveTraversals)
+    {
+        if (Traversal.Request.RequestId == RequestId)
+        {
+            OutRequest = Traversal.Request;
+            return true;
+        }
+    }
+
+    OutRequest = FOmniCustomTraversalRequest();
+    return false;
+}
+
+void UOmniCustomTraversalComponent::FinishTraversalAtIndex(int32 Index, EOmniCustomTraversalFinishReason Reason)
 {
     if (!ActiveTraversals.IsValidIndex(Index))
     {
@@ -259,13 +328,18 @@ void UOmniCustomTraversalComponent::FinishTraversalAtIndex(int32 Index)
         }
     }
 
+    if (OnTraversalFinished.IsBound())
+    {
+        OnTraversalFinished.Broadcast(Traversal.Request, Reason);
+    }
+
     if (ActiveTraversals.IsEmpty())
     {
         SetComponentTickEnabled(false);
     }
 }
 
-void UOmniCustomTraversalComponent::FinishTraversalsForLink(UNavLinkCustomComponent* LinkComp)
+void UOmniCustomTraversalComponent::FinishTraversalsForLink(UNavLinkCustomComponent* LinkComp, EOmniCustomTraversalFinishReason Reason)
 {
     if (!LinkComp)
     {
@@ -276,9 +350,27 @@ void UOmniCustomTraversalComponent::FinishTraversalsForLink(UNavLinkCustomCompon
     {
         if (ActiveTraversals[Index].Link.Get() == LinkComp)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, Reason);
         }
     }
+}
+
+int32 UOmniCustomTraversalComponent::FindLinkIndex(const UNavLinkCustomComponent* LinkComp) const
+{
+    if (!LinkComp)
+    {
+        return INDEX_NONE;
+    }
+
+    for (int32 Index = 0; Index < CustomLinks.Num(); ++Index)
+    {
+        if (CustomLinks[Index] == LinkComp)
+        {
+            return Index;
+        }
+    }
+
+    return INDEX_NONE;
 }
 
 bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
@@ -317,7 +409,9 @@ bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
         const FOmniCustomLinkSpec& B = LinkSpecs[Index];
         if (!A.SourceWorld.Equals(B.SourceWorld, 0.1f)
             || !A.TargetWorld.Equals(B.TargetWorld, 0.1f)
-            || A.Direction != B.Direction)
+            || A.Direction != B.Direction
+            || A.SourceToTargetTraversalId != B.SourceToTargetTraversalId
+            || A.TargetToSourceTraversalId != B.TargetToSourceTraversalId)
         {
             return false;
         }

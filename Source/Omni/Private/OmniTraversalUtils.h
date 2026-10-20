@@ -27,6 +27,13 @@ struct FOmniAutomaticTraversalSettings
     float MaxGroundSlopeDegrees = 44.0f;
     float AgentRadius = 34.0f;
     float AgentHalfHeight = 88.0f;
+    bool bAllowAutomaticMantle = true;
+    bool bRequireMantleLedge = true;
+    float MantleMaxHeight = 150.0f;
+    float MantleMaxReach = 120.0f;
+    bool bValidateMantlePath = true;
+    float MantleArcHeight = 35.0f;
+    int32 MantleValidationSegments = 12;
 };
 
 struct FOmniJumpValidationSettings
@@ -47,12 +54,29 @@ enum class EOmniJumpValidationResult : uint8
     Invalid
 };
 
+struct FOmniMantleValidationSettings
+{
+    bool bValidatePath = true;
+    float ArcHeight = 35.0f;
+    float AgentRadius = 34.0f;
+    float AgentHalfHeight = 88.0f;
+    int32 PathSegments = 12;
+};
+
+enum class EOmniMantleValidationResult : uint8
+{
+    Valid,
+    Blocked,
+    Invalid
+};
+
 
 /** One directional piece of the traversal plan for a Source/Target pair. */
 struct FOmniTraversalLeg
 {
     ENavLinkDirection::Type Direction = ENavLinkDirection::BothWays;
     bool bUseJump = false;
+    bool bUseMantle = false;
     bool bUseCustom = false;
     EOmniGroundTraversalResult GroundResult = EOmniGroundTraversalResult::Invalid;
 };
@@ -60,12 +84,15 @@ struct FOmniTraversalLeg
 /**
  * Shared traversal classification result used by Point, Volume, and Spline.
  * A bidirectional pair normally produces one BothWays leg. Automatic can produce
- * two one-way legs when the two directions require different traversal actions.
+ * two one-way legs when the two directions require different traversal actions, including Mantle.
  */
 struct FOmniAutomaticDirectionDiagnostic
 {
     bool bEvaluated = false;
     bool bUseJump = false;
+    bool bUseMantle = false;
+    bool bMantleValidationFallback = false;
+    bool bMantleLedgeFallback = false;
     EOmniGroundTraversalResult GroundResult = EOmniGroundTraversalResult::Invalid;
 };
 
@@ -74,6 +101,7 @@ struct FOmniTraversalPlan
     FOmniTraversalLeg Legs[2];
     int32 LegCount = 0;
     bool bAutomaticSplit = false;
+    bool bDirectionalSplit = false;
 
     /** Per-direction Automatic results retained even when both directions collapse into one BothWays leg. */
     FOmniAutomaticDirectionDiagnostic SourceToTargetAutomatic;
@@ -83,7 +111,7 @@ struct FOmniTraversalPlan
 namespace OmniTraversal
 {
     /**
-     * Resolves Native / Jump / Automatic / Custom into one or two directional traversal legs.
+     * Resolves Native / Jump / Mantle / Automatic / Custom into one or two directional traversal legs.
      * This is the canonical classifier shared by every Omni authoring shape.
      */
     FOmniTraversalPlan BuildTraversalPlan(
@@ -94,6 +122,50 @@ namespace OmniTraversal
         ENavLinkDirection::Type PairDirection,
         EOmniTraversalAction TraversalAction,
         const FOmniAutomaticTraversalSettings& AutomaticSettings);
+
+    /**
+     * Resolves traversal with optional per-direction action overrides.
+     * When overrides are enabled, Source to Target and Target to Source may independently
+     * use Native Movement, Jump, Mantle, Automatic, or Custom. Compatible results collapse back
+     * into one bidirectional link; incompatible results become two one-way legs.
+     */
+    FOmniTraversalPlan BuildDirectionalTraversalPlan(
+        UWorld* World,
+        const AActor* IgnoreActor,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type PairDirection,
+        EOmniTraversalAction DefaultTraversalAction,
+        bool bUseDirectionalActions,
+        EOmniTraversalAction SourceToTargetAction,
+        EOmniTraversalAction TargetToSourceAction,
+        const FOmniAutomaticTraversalSettings& AutomaticSettings);
+
+    /** Resolves Automatic traversal into Native, Mantle, or Jump for one direction. */
+    void ResolveAutomaticTraversal(
+        UWorld* World,
+        const AActor* IgnoreActor,
+        const FVector& StartWorld,
+        const FVector& EndWorld,
+        const FOmniAutomaticTraversalSettings& Settings,
+        bool& bOutUseJump,
+        bool& bOutUseMantle,
+        EOmniGroundTraversalResult* OutGroundResult = nullptr,
+        bool* bOutMantleValidationFallback = nullptr,
+        bool* bOutMantleLedgeFallback = nullptr);
+
+    /**
+     * Returns true when an upward Automatic Mantle candidate has usable ledge
+     * geometry: a WorldStatic face opposing travel plus a walkable, capsule-clear
+     * top immediately beyond that face near the destination height.
+     * This is intentionally an Automatic-only classification check.
+     */
+    bool HasMantleLedgeGeometry(
+        UWorld* World,
+        const AActor* IgnoreActor,
+        const FVector& StartWorld,
+        const FVector& EndWorld,
+        const FOmniAutomaticTraversalSettings& Settings);
 
     /** Returns true when Automatic traversal should use Omni's Jump smart-link execution. */
     bool ShouldUseJump(
@@ -124,6 +196,25 @@ namespace OmniTraversal
         const FVector& StartWorld,
         const FVector& EndWorld,
         const FOmniAutomaticTraversalSettings& Settings);
+
+    /** Returns the controlled three-stage path used by built-in Mantle traversal and its editor preview. */
+    FVector CalculateMantlePathPoint(
+        const FVector& Start,
+        const FVector& End,
+        float Alpha,
+        float ArcHeight);
+
+    /**
+     * Validates a built-in Mantle direction by sweeping an upright capsule along
+     * the same three-stage path used by preview and runtime movement. Endpoints
+     * are treated as feet locations and lifted to capsule-center height.
+     */
+    EOmniMantleValidationResult ValidateMantlePath(
+        UWorld* World,
+        const AActor* IgnoreActor,
+        const FVector& StartFeetWorld,
+        const FVector& EndFeetWorld,
+        const FOmniMantleValidationSettings& Settings);
 
     /**
      * Calculates a ballistic launch velocity that reaches End from Start while

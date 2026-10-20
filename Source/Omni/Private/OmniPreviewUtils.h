@@ -31,6 +31,18 @@ namespace OmniPreview
         const FVector& Offset,
         const FColor* OverrideColor = nullptr);
 
+    /** Draws built-in Mantle traversal as a compact eased arc. */
+    void DrawMantleTraversal(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        float ArcHeight,
+        int32 PathSegments,
+        float LineThickness,
+        const FVector& Offset,
+        const FColor* OverrideColor = nullptr);
+
     /** Draws designer-defined Custom traversal as a dashed directional connection. */
     void DrawCustomTraversal(
         UWorld* World,

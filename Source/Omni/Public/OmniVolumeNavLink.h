@@ -12,6 +12,7 @@ class UBoxComponent;
 class UNavAreaBase;
 class UNavLinkComponent;
 class UOmniJumpTraversalComponent;
+class UOmniMantleTraversalComponent;
 class UOmniCustomTraversalComponent;
 class USceneComponent;
 
@@ -35,7 +36,7 @@ enum class EOmniVolumeLinkDirection : uint8
  *
  * Omni projects a horizontal grid inside each volume to NavMesh, pairs valid
  * samples between the two regions, then publishes either ordinary native point
- * links or built-in Jump smart links according to Traversal Action.
+ * links or built-in Jump, Mantle, or Custom smart links according to Traversal Action.
  */
 UCLASS(Blueprintable)
 class OMNI_API AOmniVolumeNavLink : public AActor
@@ -103,88 +104,144 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Setup", meta=(DisplayName="Max Crossing Distance", ClampMin="0.0", UIMin="0.0", UIMax="5000.0", Units="cm", DisplayPriority="6"))
     float MaximumLinkDistance = 2000.0f;
 
-    /** Native Movement uses ordinary links. Jump uses ballistic smart links. Automatic chooses Native or Jump per direction. Custom hands smart-link traversal to Blueprint or C++. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Traversal Action", DisplayPriority="1"))
+    /** Native Movement uses ordinary links. Jump and Mantle use built-in smart-link traversal. Automatic chooses Native, Mantle, or Jump per direction. Custom hands smart-link traversal to Blueprint or C++. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Use Directional Actions", DisplayPriority="1"))
+    bool bUseDirectionalTraversalActions = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Traversal Action", EditCondition="!bUseDirectionalTraversalActions", EditConditionHides, DisplayPriority="2"))
     EOmniTraversalAction TraversalAction = EOmniTraversalAction::NativeMovement;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Source to Target Action", EditCondition="bUseDirectionalTraversalActions && LinkDirection != EOmniVolumeLinkDirection::TargetToSource", EditConditionHides, DisplayPriority="2"))
+    EOmniTraversalAction SourceToTargetTraversalAction = EOmniTraversalAction::NativeMovement;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Target to Source Action", EditCondition="bUseDirectionalTraversalActions && LinkDirection != EOmniVolumeLinkDirection::SourceToTarget", EditConditionHides, DisplayPriority="3"))
+    EOmniTraversalAction TargetToSourceTraversalAction = EOmniTraversalAction::NativeMovement;
+
     /** Enable directional vertical filtering for generated crossings. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Use Height Limits", DisplayPriority="2"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Use Height Limits", DisplayPriority="4"))
     bool bUseHeightLimits = false;
 
     /** Maximum upward movement allowed in a traversal direction. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Max Rise", ClampMin="0.0", UIMin="0.0", UIMax="1000.0", Units="cm", EditCondition="bUseHeightLimits", EditConditionHides, DisplayPriority="3"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Max Rise", ClampMin="0.0", UIMin="0.0", UIMax="1000.0", Units="cm", EditCondition="bUseHeightLimits", EditConditionHides, DisplayPriority="5"))
     float MaximumRise = 100.0f;
 
     /** Maximum downward movement allowed in a traversal direction. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Max Drop", ClampMin="0.0", UIMin="0.0", UIMax="2000.0", Units="cm", EditCondition="bUseHeightLimits", EditConditionHides, DisplayPriority="4"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Max Drop", ClampMin="0.0", UIMin="0.0", UIMax="2000.0", Units="cm", EditCondition="bUseHeightLimits", EditConditionHides, DisplayPriority="6"))
     float MaximumDrop = 300.0f;
 
     /** Extra height above the higher endpoint used to shape Omni's ballistic jump. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Apex Height", ClampMin="1.0", UIMin="25.0", UIMax="500.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, DisplayPriority="5"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Apex Height", ClampMin="1.0", UIMin="25.0", UIMax="500.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="7"))
     float JumpApexHeight = 150.0f;
 
     /** Reject Jump directions whose predicted Character capsule arc is blocked or exceeds the configured speed limit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Validate Jump Path", EditCondition="TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, DisplayPriority="6"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Validate Jump Path", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="8"))
     bool bValidateJumpPath = true;
 
     /** Maximum predicted horizontal launch speed. Zero disables the speed limit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Max Jump Horizontal Speed", ClampMin="0.0", UIMin="0.0", UIMax="3000.0", Units="cm/s", EditCondition="bValidateJumpPath && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)", EditConditionHides, AdvancedDisplay))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Max Jump Horizontal Speed", ClampMin="0.0", UIMin="0.0", UIMax="3000.0", Units="cm/s", EditCondition="bValidateJumpPath && ((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     float MaximumJumpHorizontalSpeed = 1600.0f;
 
-    /** Capsule radius used by Automatic native-path validation and Jump clearance validation. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Traversal Agent Radius", ClampMin="1.0", UIMin="10.0", UIMax="100.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic || (bValidateJumpPath && TraversalAction == EOmniTraversalAction::Jump)", EditConditionHides, AdvancedDisplay))
+    /** Capsule radius used by Automatic native-path, Jump, and Mantle clearance validation. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Traversal Agent Radius", ClampMin="1.0", UIMin="10.0", UIMax="100.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Automatic || TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Mantle)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle)))", EditConditionHides, AdvancedDisplay))
     float JumpValidationAgentRadius = 34.0f;
 
-    /** Capsule half height used by Automatic native-path validation and Jump clearance validation. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Traversal Agent Half Height", ClampMin="1.0", UIMin="20.0", UIMax="200.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic || (bValidateJumpPath && TraversalAction == EOmniTraversalAction::Jump)", EditConditionHides, AdvancedDisplay))
+    /** Capsule half height used by Automatic native-path, Jump, and Mantle clearance validation. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Traversal Agent Half Height", ClampMin="1.0", UIMin="20.0", UIMax="200.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Automatic || TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Mantle)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle)))", EditConditionHides, AdvancedDisplay))
     float JumpValidationAgentHalfHeight = 88.0f;
 
     /** Number of capsule sweeps used to validate each ballistic arc. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Validation Segments", ClampMin="4", ClampMax="64", UIMin="8", UIMax="32", EditCondition="bValidateJumpPath && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)", EditConditionHides, AdvancedDisplay))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Validation Segments", ClampMin="4", ClampMax="64", UIMin="8", UIMax="32", EditCondition="bValidateJumpPath && ((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     int32 JumpValidationSegments = 16;
 
     /** Navigation area applied to Jump smart links. Omni Jump is higher cost than normal walkable navigation by default. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Area Class", EditCondition="TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, AdvancedDisplay))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Area Class", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     TSubclassOf<UNavAreaBase> JumpAreaClass;
 
     /** How close the Character must get to the destination before normal path following resumes. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Landing Tolerance", ClampMin="1.0", UIMin="25.0", UIMax="250.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, AdvancedDisplay))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Landing Tolerance", ClampMin="1.0", UIMin="25.0", UIMax="250.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     float JumpLandingTolerance = 75.0f;
 
     /** Safety timeout that prevents a failed jump from holding path following forever. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Timeout", ClampMin="0.25", UIMin="0.5", UIMax="10.0", Units="s", EditCondition="TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, AdvancedDisplay))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Jump Timeout", ClampMin="0.25", UIMin="0.5", UIMax="10.0", Units="s", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Jump || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Jump || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Jump || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     float JumpTraversalTimeout = 3.0f;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Mantle Duration", ClampMin="0.05", UIMin="0.15", UIMax="2.0", Units="s", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="9"))
+    float MantleDuration = 0.45f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Mantle Arc Height", ClampMin="0.0", UIMin="0.0", UIMax="150.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="10"))
+    float MantleArcHeight = 35.0f;
+
+    /** Rejects built-in Mantle directions whose swept traversal capsule is blocked by WorldStatic geometry. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Validate Mantle Path", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="11"))
+    bool bValidateMantlePath = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Mantle Validation Segments", ClampMin="6", ClampMax="64", UIMin="8", UIMax="32", EditCondition="bValidateMantlePath && ((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
+    int32 MantleValidationSegments = 12;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Mantle Landing Tolerance", ClampMin="1.0", UIMin="5.0", UIMax="100.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
+    float MantleLandingTolerance = 20.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Mantle Timeout", ClampMin="0.25", UIMin="0.5", UIMax="10.0", Units="s", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
+    float MantleTraversalTimeout = 2.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Mantle Area Class", EditCondition="((!bUseDirectionalTraversalActions && (TraversalAction == EOmniTraversalAction::Mantle || TraversalAction == EOmniTraversalAction::Automatic)) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Mantle || SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Mantle || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
+    TSubclassOf<UNavAreaBase> MantleAreaClass;
+
     /** Safety timeout for designer-driven Custom traversal requests. If it expires, Omni resumes path following to avoid a permanent stall. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Traversal Timeout", ClampMin="0.25", UIMin="0.5", UIMax="30.0", Units="s", EditCondition="TraversalAction == EOmniTraversalAction::Custom", EditConditionHides, DisplayPriority="5"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Traversal Timeout", ClampMin="0.25", UIMin="0.5", UIMax="30.0", Units="s", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Custom) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Custom || TargetToSourceTraversalAction == EOmniTraversalAction::Custom)))", EditConditionHides, DisplayPriority="9"))
     float CustomTraversalTimeout = 5.0f;
 
+    /** Identifier included with non-directional Custom traversal requests so project logic can route the request without inspecting geometry. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Traversal ID", EditCondition="!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Custom", EditConditionHides, DisplayPriority="10"))
+    FName CustomTraversalId = NAME_None;
+
+    /** Identifier reported when a directional Custom request travels from Source toward Target. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Source to Target Custom ID", EditCondition="bUseDirectionalTraversalActions && LinkDirection != EOmniVolumeLinkDirection::TargetToSource && SourceToTargetTraversalAction == EOmniTraversalAction::Custom", EditConditionHides, DisplayPriority="10"))
+    FName SourceToTargetCustomTraversalId = NAME_None;
+
+    /** Identifier reported when a directional Custom request travels from Target toward Source. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Target to Source Custom ID", EditCondition="bUseDirectionalTraversalActions && LinkDirection != EOmniVolumeLinkDirection::SourceToTarget && TargetToSourceTraversalAction == EOmniTraversalAction::Custom", EditConditionHides, DisplayPriority="11"))
+    FName TargetToSourceCustomTraversalId = NAME_None;
+
     /** Validate whether continuously supported ground is actually walkable before Automatic keeps a Native link. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Validate Native Path", EditCondition="TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, DisplayPriority="6"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Validate Native Path", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="10"))
     bool bValidateAutomaticNativePath = true;
 
     /** Largest single ground-height change Automatic considers ordinary walkable movement. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Max Step Height", ClampMin="0.0", UIMin="0.0", UIMax="100.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic && bValidateAutomaticNativePath", EditConditionHides, DisplayPriority="7"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Max Step Height", ClampMin="0.0", UIMin="0.0", UIMax="100.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic))) && bValidateAutomaticNativePath", EditConditionHides, DisplayPriority="11"))
     float AutomaticMaxStepHeight = 45.0f;
 
     /** Steepest supported ground angle Automatic considers ordinary walkable movement. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Max Ground Slope", ClampMin="0.0", ClampMax="89.0", UIMin="0.0", UIMax="60.0", Units="deg", EditCondition="TraversalAction == EOmniTraversalAction::Automatic && bValidateAutomaticNativePath", EditConditionHides, DisplayPriority="8"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Max Ground Slope", ClampMin="0.0", ClampMax="89.0", UIMin="0.0", UIMax="60.0", Units="deg", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic))) && bValidateAutomaticNativePath", EditConditionHides, DisplayPriority="12"))
     float AutomaticMaxGroundSlopeDegrees = 44.0f;
 
-    /** In Automatic mode, unsupported crossings rising more than this are classified as Jump. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Rise Threshold", ClampMin="0.0", UIMin="0.0", UIMax="100.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, DisplayPriority="9"))
+    /** In Automatic mode, upward crossings above this threshold require special traversal. Short rises may become Mantle; others become Jump. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Rise Threshold", ClampMin="0.0", UIMin="0.0", UIMax="100.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="13"))
     float AutomaticRiseThreshold = 10.0f;
 
     /** In Automatic mode, unsupported downward crossings no longer than this may remain Native drops. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Native Drop Distance", ClampMin="0.0", UIMin="0.0", UIMax="1000.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, DisplayPriority="10"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Native Drop Distance", ClampMin="0.0", UIMin="0.0", UIMax="1000.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="14"))
     float AutomaticNativeDropMaxDistance = 200.0f;
 
-    /** How far Automatic mode probes below a crossing to decide whether ordinary ground support exists. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Ground Probe Depth", ClampMin="1.0", UIMin="25.0", UIMax="300.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, AdvancedDisplay))
+    /** Allow Automatic to classify short upward ledges as built-in Mantle instead of Jump. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Use Mantle", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, DisplayPriority="15"))
+    bool bAutomaticUseMantle = true;
+
+    /** Require Automatic Mantle candidates to have a facing ledge plus a usable, capsule-clear top near the destination height. Explicit Mantle is unaffected. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Require Ledge Geometry", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic))) && bAutomaticUseMantle", EditConditionHides, DisplayPriority="16"))
+    bool bAutomaticRequireMantleLedge = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Mantle Max Height", ClampMin="0.0", UIMin="50.0", UIMax="250.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic))) && bAutomaticUseMantle", EditConditionHides, DisplayPriority="17"))
+    float AutomaticMantleMaxHeight = 150.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Mantle Max Reach", ClampMin="0.0", UIMin="25.0", UIMax="300.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic))) && bAutomaticUseMantle", EditConditionHides, DisplayPriority="18"))
+    float AutomaticMantleMaxReach = 120.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Ground Probe Depth", ClampMin="1.0", UIMin="25.0", UIMax="300.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     float AutomaticGroundProbeDepth = 75.0f;
 
     /** Spacing between physical ground-support probes in Automatic mode. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Ground Probe Spacing", ClampMin="10.0", UIMin="25.0", UIMax="250.0", Units="cm", EditCondition="TraversalAction == EOmniTraversalAction::Automatic", EditConditionHides, AdvancedDisplay))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Auto Ground Probe Spacing", ClampMin="10.0", UIMin="25.0", UIMax="250.0", Units="cm", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Automatic) || (bUseDirectionalTraversalActions && (SourceToTargetTraversalAction == EOmniTraversalAction::Automatic || TargetToSourceTraversalAction == EOmniTraversalAction::Automatic)))", EditConditionHides, AdvancedDisplay))
     float AutomaticGroundProbeSpacing = 75.0f;
 
     /** Draw projected samples and the actual generated pairings while this actor is selected. */
@@ -213,6 +270,9 @@ public:
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Status", meta=(DisplayName="Jump Links"))
     int32 JumpLinkCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Status", meta=(DisplayName="Mantle Links"))
+    int32 MantleLinkCount = 0;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Status", meta=(DisplayName="Custom Links"))
     int32 CustomLinkCount = 0;
@@ -309,6 +369,10 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Automatic Split Pairs"))
     int32 AutomaticSplitPairCount = 0;
 
+    /** Both Ways pairs split because Source-to-Target and Target-to-Source use different explicit traversal actions. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Directional Split Pairs"))
+    int32 DirectionalSplitPairCount = 0;
+
     /** Automatic directions promoted to Jump because the supported ground changed height too abruptly. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Auto Step Promotions"))
     int32 AutomaticStepPromotionCount = 0;
@@ -321,6 +385,15 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Auto Clearance Promotions"))
     int32 AutomaticBlockedPromotionCount = 0;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Auto Mantle Promotions"))
+    int32 AutomaticMantlePromotionCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Auto Mantle Validation Fallbacks"))
+    int32 AutomaticMantleValidationFallbackCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Auto Ledge Geometry Fallbacks"))
+    int32 AutomaticMantleLedgeFallbackCount = 0;
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Arc"))
     int32 RejectedJumpArcCount = 0;
 
@@ -329,6 +402,12 @@ public:
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Jump Limited To One Way"))
     int32 JumpRestrictedToOneWayCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Path"))
+    int32 RejectedMantlePathCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Mantle Limited To One Way"))
+    int32 MantleRestrictedToOneWayCount = 0;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay))
     int32 MergedDuplicateCount = 0;
@@ -352,6 +431,9 @@ public:
     UPROPERTY(VisibleAnywhere, Category="Omni|Advanced", meta=(AdvancedDisplay))
     TObjectPtr<UOmniJumpTraversalComponent> JumpTraversal;
 
+    UPROPERTY(VisibleAnywhere, Category="Omni|Advanced", meta=(AdvancedDisplay))
+    TObjectPtr<UOmniMantleTraversalComponent> MantleTraversal;
+
     /** Runtime smart-link dispatcher used when Traversal Action is Custom. Bind OnTraversalRequested in Blueprint or C++. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Omni|Advanced", meta=(AdvancedDisplay))
     TObjectPtr<UOmniCustomTraversalComponent> CustomTraversal;
@@ -369,6 +451,7 @@ private:
         FVector TargetWorld = FVector::ZeroVector;
         ENavLinkDirection::Type NativeDirection = ENavLinkDirection::BothWays;
         bool bUsesJumpTraversal = false;
+        bool bUsesMantleTraversal = false;
         bool bUsesCustomTraversal = false;
     };
 
@@ -377,7 +460,7 @@ private:
     bool IsProjectedPointInsideBox(const FVector& WorldPoint, const UBoxComponent& Box) const;
     void BuildNearestPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
     void BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
-    bool AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks);
+    bool AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks);
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     static int32 CalculateAxisSampleCount(double WorldLength, double Spacing);
     int32 FindNearestUsableSampleIndex(const FVector& Point, bool bPointIsSource, const TArray<FProjectedGridSample>& Samples) const;
@@ -386,8 +469,10 @@ private:
     bool IsTraversalAllowedByHeight(const FVector& StartWorld, const FVector& EndWorld) const;
     bool ResolvePairDirection(const FVector& SourceWorld, const FVector& TargetWorld, ENavLinkDirection::Type& OutDirection, bool& bOutHeightRestricted) const;
     bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, bool& bOutBlocked, bool& bOutTooFast) const;
+    bool IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld) const;
     float GetEffectiveLinkSpacing() const;
     ENavLinkDirection::Type GetNativeDirection() const;
+    bool UsesTraversalAction(EOmniTraversalAction Action) const;
     void UpdateGenerationStatus();
     void ApplyEditorVisualStyle();
     void ResetDebugCounters();
@@ -406,6 +491,7 @@ private:
     TArray<FVector> PreviewTargetSamples;
     TArray<FProjectedPair> PreviewGeneratedPairs;
     TArray<FProjectedPair> PreviewRejectedJumpPairs;
+    TArray<FProjectedPair> PreviewRejectedMantlePairs;
 
     bool bIsRegenerating = false;
 };
