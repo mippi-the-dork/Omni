@@ -331,17 +331,47 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Auto Ledge Geometry Fallbacks"))
     int32 AutomaticMantleLedgeFallbackCount = 0;
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Arc"))
-    int32 RejectedJumpArcCount = 0;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Departure Support"))
+    int32 RejectedJumpDepartureSupportCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Departure Clearance"))
+    int32 RejectedJumpDepartureClearanceCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Path"))
+    int32 RejectedJumpPathCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Landing Support"))
+    int32 RejectedJumpLandingSupportCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Landing Clearance"))
+    int32 RejectedJumpLandingClearanceCount = 0;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Speed"))
     int32 RejectedJumpSpeedCount = 0;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Jump Invalid"))
+    int32 RejectedJumpInvalidCount = 0;
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Jump Limited To One Way"))
     int32 JumpRestrictedToOneWayCount = 0;
 
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Departure Support"))
+    int32 RejectedMantleDepartureSupportCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Departure Clearance"))
+    int32 RejectedMantleDepartureClearanceCount = 0;
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Path"))
     int32 RejectedMantlePathCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Landing Support"))
+    int32 RejectedMantleLandingSupportCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Landing Clearance"))
+    int32 RejectedMantleLandingClearanceCount = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Rejected Mantle Invalid"))
+    int32 RejectedMantleInvalidCount = 0;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category="Omni|Diagnostics", meta=(AdvancedDisplay, DisplayName="Mantle Limited To One Way"))
     int32 MantleRestrictedToOneWayCount = 0;
@@ -355,14 +385,17 @@ private:
         bool bUsesJumpTraversal = false;
         bool bUsesMantleTraversal = false;
         bool bUsesCustomTraversal = false;
+        bool bAutomaticMantleFallback = false;
+        uint8 ValidationFailureCode = 0;
+        bool bValidationSpeedFailure = false;
     };
 
     bool ProjectEndpoint(const FVector& CandidateWorld, bool bSource, FVector& OutProjectedWorld);
     bool GenerateProjectedConnection(const FVector& SourceWorld, const FVector& TargetWorld, TArray<FNavigationLink>& OutNativeLinks, TArray<FOmniJumpLinkSpec>& OutJumpLinks, TArray<FOmniMantleLinkSpec>& OutMantleLinks, TArray<FOmniCustomLinkSpec>& OutCustomLinks);
     bool IsTraversalAllowedByHeight(const FVector& StartWorld, const FVector& EndWorld) const;
     bool ResolvePairDirection(const FVector& SourceWorld, const FVector& TargetWorld, ENavLinkDirection::Type& OutDirection, bool& bOutHeightRestricted) const;
-    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, bool& bOutBlocked, bool& bOutTooFast) const;
-    bool IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld) const;
+    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast) const;
+    bool IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode) const;
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     ENavLinkDirection::Type GetNativeDirection() const;
     bool UsesTraversalAction(EOmniTraversalAction Action) const;

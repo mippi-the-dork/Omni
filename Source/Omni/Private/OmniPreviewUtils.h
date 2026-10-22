@@ -9,10 +9,36 @@ namespace OmniPreview
 {
     FColor SourceColor();
     FColor TargetColor();
+    FColor NativeColor();
+    FColor JumpColor();
+    FColor MantleColor();
+    FColor CustomColor();
+    FColor FallbackColor();
     FColor RejectedColor();
-    FColor DirectionColor(ENavLinkDirection::Type Direction);
 
     void DrawSamplePoint(UWorld* World, const FVector& WorldPoint, const FColor& Color, float PointSize, const FVector& Offset);
+    void DrawFallbackMarker(UWorld* World, const FVector& SourceWorld, const FVector& TargetWorld, const FVector& Offset);
+
+    /** Draws a short editor-only reason label beside one rejected directional traversal. */
+    void DrawRejectedReasonLabel(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        const FString& Reason,
+        const FVector& Offset);
+
+    /** Draws a compact marker at the diagnostic stage location for one rejected traversal. */
+    void DrawRejectedFailureMarker(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        uint8 FailureCode,
+        bool bSpeedFailure,
+        bool bMantleTraversal,
+        float ArcHeight,
+        const FVector& Offset);
 
     /**
      * Draws one generated Omni traversal using the same directional convention for

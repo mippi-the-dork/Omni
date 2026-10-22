@@ -49,7 +49,11 @@ struct FOmniJumpValidationSettings
 enum class EOmniJumpValidationResult : uint8
 {
     Valid,
-    Blocked,
+    DepartureSupport,
+    DepartureClearance,
+    PathBlocked,
+    LandingSupport,
+    LandingClearance,
     TooFast,
     Invalid
 };
@@ -66,7 +70,11 @@ struct FOmniMantleValidationSettings
 enum class EOmniMantleValidationResult : uint8
 {
     Valid,
-    Blocked,
+    DepartureSupport,
+    DepartureClearance,
+    PathBlocked,
+    LandingSupport,
+    LandingClearance,
     Invalid
 };
 

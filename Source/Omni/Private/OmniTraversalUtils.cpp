@@ -5,6 +5,188 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 
+namespace
+{
+    /**
+     * Verifies that a traversal endpoint has enough nearby static support to be a
+     * credible standing point for the configured upright capsule. The endpoint itself
+     * must be supported, and at least three of four radius-scaled footprint probes
+     * must also find support near the authored endpoint height. This deliberately
+     * allows one open edge while rejecting corner-biased and effectively unsupported
+     * endpoints. StartFeetWorld provides the opposite endpoint so the footprint can
+     * be oriented along the traversal axis.
+     */
+    bool HasTraversalEndpointSupport(
+        UWorld* World,
+        const AActor* IgnoreActor,
+        const FVector& StartFeetWorld,
+        const FVector& EndFeetWorld,
+        float AgentRadius)
+    {
+        if (!World || StartFeetWorld.ContainsNaN() || EndFeetWorld.ContainsNaN())
+        {
+            return false;
+        }
+
+        const float SafeRadius = FMath::Max(1.0f, AgentRadius);
+        const float FootprintOffset = FMath::Max(5.0f, SafeRadius * 0.65f);
+        const float ProbeLift = FMath::Max(25.0f, SafeRadius);
+        const float ProbeDepth = FMath::Max(35.0f, SafeRadius * 1.5f);
+        const float HeightTolerance = FMath::Max(15.0f, SafeRadius);
+
+        FVector TravelDirection = EndFeetWorld - StartFeetWorld;
+        TravelDirection.Z = 0.0f;
+        if (!TravelDirection.Normalize())
+        {
+            TravelDirection = FVector::ForwardVector;
+        }
+
+        FVector LateralDirection = FVector::CrossProduct(FVector::UpVector, TravelDirection);
+        if (!LateralDirection.Normalize())
+        {
+            LateralDirection = FVector::RightVector;
+        }
+
+        FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(OmniTraversalEndpointSupport), false);
+        if (IgnoreActor)
+        {
+            QueryParams.AddIgnoredActor(IgnoreActor);
+        }
+
+        auto HasSupportAt = [&](const FVector& Offset)
+        {
+            const FVector ProbeFeet = EndFeetWorld + Offset;
+            const FVector TraceStart = ProbeFeet + FVector(0.0, 0.0, ProbeLift);
+            const FVector TraceEnd = ProbeFeet - FVector(0.0, 0.0, ProbeDepth);
+
+            FHitResult Hit;
+            if (!World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_WorldStatic, QueryParams))
+            {
+                return false;
+            }
+
+            const FVector SupportNormal = Hit.ImpactNormal.GetSafeNormal();
+            if (SupportNormal.Z <= 0.25f)
+            {
+                return false;
+            }
+
+            return FMath::Abs(Hit.ImpactPoint.Z - EndFeetWorld.Z) <= HeightTolerance + KINDA_SMALL_NUMBER;
+        };
+
+        // The authored/projected destination itself must always be supported.
+        if (!HasSupportAt(FVector::ZeroVector))
+        {
+            return false;
+        }
+
+        const FVector FootprintOffsets[] =
+        {
+            TravelDirection * FootprintOffset,
+            -TravelDirection * FootprintOffset,
+            LateralDirection * FootprintOffset,
+            -LateralDirection * FootprintOffset
+        };
+
+        int32 SupportedOuterProbes = 0;
+        for (const FVector& Offset : FootprintOffsets)
+        {
+            if (HasSupportAt(Offset))
+            {
+                ++SupportedOuterProbes;
+            }
+        }
+
+        return SupportedOuterProbes >= 3;
+    }
+
+    /**
+     * Verifies that a supported traversal endpoint also gives the configured upright
+     * capsule enough room to stand and move a short distance away from the open edge.
+     * At the destination this is landing recovery space. When called with reversed
+     * endpoints at the source, the same rule becomes departure approach space behind
+     * the takeoff point.
+     */
+    bool HasTraversalEndpointRecoveryClearance(
+        UWorld* World,
+        const AActor* IgnoreActor,
+        const FVector& StartFeetWorld,
+        const FVector& EndFeetWorld,
+        float AgentRadius,
+        float AgentHalfHeight)
+    {
+        if (!World || StartFeetWorld.ContainsNaN() || EndFeetWorld.ContainsNaN())
+        {
+            return false;
+        }
+
+        const float SafeRadius = FMath::Max(1.0f, AgentRadius);
+        const float SafeHalfHeight = FMath::Max(SafeRadius, AgentHalfHeight);
+
+        FVector TravelDirection = EndFeetWorld - StartFeetWorld;
+        TravelDirection.Z = 0.0f;
+        if (!TravelDirection.Normalize())
+        {
+            // With no meaningful horizontal travel direction there is no stable
+            // definition of "inward" recovery space. The endpoint capsule
+            // clearance check still provides the useful safety guarantee.
+            TravelDirection = FVector::ZeroVector;
+        }
+
+        const FVector CenterOffset(0.0, 0.0, SafeHalfHeight + 2.0f);
+        const FVector LandingCenter = EndFeetWorld + CenterOffset;
+        const float RecoveryDistance = FMath::Max(10.0f, SafeRadius * 0.75f);
+        const FVector RecoveryCenter = LandingCenter + TravelDirection * RecoveryDistance;
+        const FCollisionShape AgentShape = FCollisionShape::MakeCapsule(SafeRadius, SafeHalfHeight);
+
+        FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(OmniTraversalEndpointRecoveryClearance), false);
+        if (IgnoreActor)
+        {
+            QueryParams.AddIgnoredActor(IgnoreActor);
+        }
+
+        if (World->OverlapBlockingTestByChannel(
+                LandingCenter,
+                FQuat::Identity,
+                ECC_WorldStatic,
+                AgentShape,
+                QueryParams))
+        {
+            return false;
+        }
+
+        if (TravelDirection.IsNearlyZero())
+        {
+            return true;
+        }
+
+        if (World->OverlapBlockingTestByChannel(
+                RecoveryCenter,
+                FQuat::Identity,
+                ECC_WorldStatic,
+                AgentShape,
+                QueryParams))
+        {
+            return false;
+        }
+
+        FHitResult RecoveryHit;
+        if (World->SweepSingleByChannel(
+                RecoveryHit,
+                LandingCenter,
+                RecoveryCenter,
+                FQuat::Identity,
+                ECC_WorldStatic,
+                AgentShape,
+                QueryParams))
+        {
+            return false;
+        }
+
+        return true;
+    }
+}
+
 namespace OmniTraversal
 {
     FOmniTraversalPlan BuildTraversalPlan(
@@ -661,6 +843,24 @@ namespace OmniTraversal
         const FVector StartCenter = StartFeetWorld + CenterOffset;
         const FVector EndCenter = EndFeetWorld + CenterOffset;
 
+        // Diagnose endpoints in traversal order so every rejected direction has one
+        // actionable first-failure reason rather than several overlapping counters.
+        if (!HasTraversalEndpointSupport(World, IgnoreActor, EndFeetWorld, StartFeetWorld, SafeRadius))
+        {
+            return EOmniMantleValidationResult::DepartureSupport;
+        }
+
+        if (!HasTraversalEndpointRecoveryClearance(
+                World,
+                IgnoreActor,
+                EndFeetWorld,
+                StartFeetWorld,
+                SafeRadius,
+                SafeHalfHeight))
+        {
+            return EOmniMantleValidationResult::DepartureClearance;
+        }
+
         FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(OmniMantlePathValidation), false);
         if (IgnoreActor)
         {
@@ -685,10 +885,26 @@ namespace OmniTraversal
                     AgentShape,
                     QueryParams))
             {
-                return EOmniMantleValidationResult::Blocked;
+                return EOmniMantleValidationResult::PathBlocked;
             }
 
             PreviousPoint = CurrentPoint;
+        }
+
+        if (!HasTraversalEndpointSupport(World, IgnoreActor, StartFeetWorld, EndFeetWorld, SafeRadius))
+        {
+            return EOmniMantleValidationResult::LandingSupport;
+        }
+
+        if (!HasTraversalEndpointRecoveryClearance(
+                World,
+                IgnoreActor,
+                StartFeetWorld,
+                EndFeetWorld,
+                SafeRadius,
+                SafeHalfHeight))
+        {
+            return EOmniMantleValidationResult::LandingClearance;
         }
 
         return EOmniMantleValidationResult::Valid;
@@ -734,7 +950,7 @@ namespace OmniTraversal
             return EOmniJumpValidationResult::Valid;
         }
 
-        if (!World)
+        if (!World || StartFeetWorld.ContainsNaN() || EndFeetWorld.ContainsNaN())
         {
             return EOmniJumpValidationResult::Invalid;
         }
@@ -745,6 +961,22 @@ namespace OmniTraversal
         const FVector CenterOffset(0.0, 0.0, SafeHalfHeight + 2.0f);
         const FVector StartCenter = StartFeetWorld + CenterOffset;
         const FVector EndCenter = EndFeetWorld + CenterOffset;
+
+        if (!HasTraversalEndpointSupport(World, IgnoreActor, EndFeetWorld, StartFeetWorld, SafeRadius))
+        {
+            return EOmniJumpValidationResult::DepartureSupport;
+        }
+
+        if (!HasTraversalEndpointRecoveryClearance(
+                World,
+                IgnoreActor,
+                EndFeetWorld,
+                StartFeetWorld,
+                SafeRadius,
+                SafeHalfHeight))
+        {
+            return EOmniJumpValidationResult::DepartureClearance;
+        }
 
         FVector LaunchVelocity = FVector::ZeroVector;
         float TotalTime = 0.0f;
@@ -789,12 +1021,29 @@ namespace OmniTraversal
                     AgentShape,
                     QueryParams))
             {
-                return EOmniJumpValidationResult::Blocked;
+                return EOmniJumpValidationResult::PathBlocked;
             }
 
             PreviousPoint = CurrentPoint;
         }
 
+        if (!HasTraversalEndpointSupport(World, IgnoreActor, StartFeetWorld, EndFeetWorld, SafeRadius))
+        {
+            return EOmniJumpValidationResult::LandingSupport;
+        }
+
+        if (!HasTraversalEndpointRecoveryClearance(
+                World,
+                IgnoreActor,
+                StartFeetWorld,
+                EndFeetWorld,
+                SafeRadius,
+                SafeHalfHeight))
+        {
+            return EOmniJumpValidationResult::LandingClearance;
+        }
+
         return EOmniJumpValidationResult::Valid;
     }
+
 }

@@ -828,15 +828,23 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return true;
     };
 
-    auto RecordRejectedJump = [&](ENavLinkDirection::Type Direction, bool bBlocked, bool bTooFast)
+    auto RecordRejectedJump = [&](ENavLinkDirection::Type Direction, int32 FailureCode, bool bTooFast)
     {
-        if (bBlocked)
-        {
-            ++RejectedJumpArcCount;
-        }
         if (bTooFast)
         {
             ++RejectedJumpSpeedCount;
+        }
+        else
+        {
+            switch (FailureCode)
+            {
+            case 1: ++RejectedJumpDepartureSupportCount; break;
+            case 2: ++RejectedJumpDepartureClearanceCount; break;
+            case 3: ++RejectedJumpPathCount; break;
+            case 4: ++RejectedJumpLandingSupportCount; break;
+            case 5: ++RejectedJumpLandingClearanceCount; break;
+            default: ++RejectedJumpInvalidCount; break;
+            }
         }
 
         FProjectedPair PreviewPair = Pair;
@@ -844,6 +852,8 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         PreviewPair.bUsesJumpTraversal = true;
         PreviewPair.bUsesMantleTraversal = false;
         PreviewPair.bUsesCustomTraversal = false;
+        PreviewPair.ValidationFailureCode = static_cast<uint8>(FailureCode);
+        PreviewPair.bValidationSpeedFailure = bTooFast;
         PreviewRejectedJumpPairs.Add(PreviewPair);
     };
 
@@ -851,26 +861,36 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     {
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
         const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
-        bool bBlocked = false;
+        int32 FailureCode = 0;
         bool bTooFast = false;
-        if (IsJumpDirectionValid(StartWorld, EndWorld, bBlocked, bTooFast))
+        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast))
         {
             return true;
         }
 
-        RecordRejectedJump(Direction, bBlocked, bTooFast);
+        RecordRejectedJump(Direction, FailureCode, bTooFast);
         return false;
     };
 
-    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction)
+    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction, int32 FailureCode)
     {
-        ++RejectedMantlePathCount;
+        switch (FailureCode)
+        {
+        case 1: ++RejectedMantleDepartureSupportCount; break;
+        case 2: ++RejectedMantleDepartureClearanceCount; break;
+        case 3: ++RejectedMantlePathCount; break;
+        case 4: ++RejectedMantleLandingSupportCount; break;
+        case 5: ++RejectedMantleLandingClearanceCount; break;
+        default: ++RejectedMantleInvalidCount; break;
+        }
 
         FProjectedPair PreviewPair = Pair;
         PreviewPair.NativeDirection = Direction;
         PreviewPair.bUsesJumpTraversal = false;
         PreviewPair.bUsesMantleTraversal = true;
         PreviewPair.bUsesCustomTraversal = false;
+        PreviewPair.ValidationFailureCode = static_cast<uint8>(FailureCode);
+        PreviewPair.bValidationSpeedFailure = false;
         PreviewRejectedMantlePairs.Add(PreviewPair);
     };
 
@@ -878,12 +898,13 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     {
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
         const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
-        if (IsMantleDirectionValid(StartWorld, EndWorld))
+        int32 FailureCode = 0;
+        if (IsMantleDirectionValid(StartWorld, EndWorld, FailureCode))
         {
             return true;
         }
 
-        RecordRejectedMantle(Direction);
+        RecordRejectedMantle(Direction, FailureCode);
         return false;
     };
 
@@ -1008,7 +1029,11 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
             if (Diagnostic.bMantleValidationFallback)
             {
                 ++AutomaticMantleValidationFallbackCount;
-                RecordRejectedMantle(Direction);
+                const FVector MantleStartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
+                const FVector MantleEndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
+                int32 FailureCode = 0;
+                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode);
+                RecordRejectedMantle(Direction, FailureCode);
             }
 
             if (Diagnostic.bMantleLedgeFallback)
@@ -1053,6 +1078,29 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     {
         const FOmniTraversalLeg& Leg = TraversalPlan.Legs[LegIndex];
         const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom);
+        if (bAdded && UsesTraversalAction(EOmniTraversalAction::Automatic) && PreviewGeneratedPairs.Num() > 0)
+        {
+            auto IsMantleFallback = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
+            {
+                return Diagnostic.bEvaluated && (Diagnostic.bMantleValidationFallback || Diagnostic.bMantleLedgeFallback);
+            };
+
+            bool bAutomaticMantleFallback = false;
+            if (Leg.Direction == ENavLinkDirection::LeftToRight)
+            {
+                bAutomaticMantleFallback = IsMantleFallback(TraversalPlan.SourceToTargetAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::RightToLeft)
+            {
+                bAutomaticMantleFallback = IsMantleFallback(TraversalPlan.TargetToSourceAutomatic);
+            }
+            else
+            {
+                bAutomaticMantleFallback = IsMantleFallback(TraversalPlan.SourceToTargetAutomatic) || IsMantleFallback(TraversalPlan.TargetToSourceAutomatic);
+            }
+
+            PreviewGeneratedPairs.Last().bAutomaticMantleFallback = bAutomaticMantleFallback;
+        }
         bAnyAdded |= bAdded;
         AddedLegCount += bAdded ? 1 : 0;
     }
@@ -1303,9 +1351,9 @@ bool AOmniSplineNavLink::IsPointInsidePolygon2D(const FVector2D& Point, const TA
     return bInside;
 }
 
-bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, bool& bOutBlocked, bool& bOutTooFast) const
+bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast) const
 {
-    bOutBlocked = false;
+    OutFailureCode = 0;
     bOutTooFast = false;
 
     FOmniJumpValidationSettings Settings;
@@ -1323,12 +1371,23 @@ bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const F
     }
 
     bOutTooFast = Result == EOmniJumpValidationResult::TooFast;
-    bOutBlocked = Result == EOmniJumpValidationResult::Blocked || Result == EOmniJumpValidationResult::Invalid;
+    switch (Result)
+    {
+    case EOmniJumpValidationResult::DepartureSupport: OutFailureCode = 1; break;
+    case EOmniJumpValidationResult::DepartureClearance: OutFailureCode = 2; break;
+    case EOmniJumpValidationResult::PathBlocked: OutFailureCode = 3; break;
+    case EOmniJumpValidationResult::LandingSupport: OutFailureCode = 4; break;
+    case EOmniJumpValidationResult::LandingClearance: OutFailureCode = 5; break;
+    case EOmniJumpValidationResult::Invalid: OutFailureCode = 6; break;
+    default: break;
+    }
     return false;
 }
 
-bool AOmniSplineNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld) const
+bool AOmniSplineNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode) const
 {
+    OutFailureCode = 0;
+
     FOmniMantleValidationSettings Settings;
     Settings.bValidatePath = bValidateMantlePath;
     Settings.ArcHeight = MantleArcHeight;
@@ -1336,7 +1395,23 @@ bool AOmniSplineNavLink::IsMantleDirectionValid(const FVector& StartWorld, const
     Settings.AgentHalfHeight = JumpValidationAgentHalfHeight;
     Settings.PathSegments = MantleValidationSegments;
 
-    return OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings) == EOmniMantleValidationResult::Valid;
+    const EOmniMantleValidationResult Result = OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings);
+    if (Result == EOmniMantleValidationResult::Valid)
+    {
+        return true;
+    }
+
+    switch (Result)
+    {
+    case EOmniMantleValidationResult::DepartureSupport: OutFailureCode = 1; break;
+    case EOmniMantleValidationResult::DepartureClearance: OutFailureCode = 2; break;
+    case EOmniMantleValidationResult::PathBlocked: OutFailureCode = 3; break;
+    case EOmniMantleValidationResult::LandingSupport: OutFailureCode = 4; break;
+    case EOmniMantleValidationResult::LandingClearance: OutFailureCode = 5; break;
+    case EOmniMantleValidationResult::Invalid: OutFailureCode = 6; break;
+    default: break;
+    }
+    return false;
 }
 
 float AOmniSplineNavLink::GetEffectiveLinkSpacing() const
@@ -1421,7 +1496,7 @@ void AOmniSplineNavLink::UpdateGenerationStatus()
 
     if (GeneratedLinkCount == 0)
     {
-        if (RejectedJumpArcCount > 0 || RejectedJumpSpeedCount > 0)
+        if ((RejectedJumpDepartureSupportCount + RejectedJumpDepartureClearanceCount + RejectedJumpPathCount + RejectedJumpLandingSupportCount + RejectedJumpLandingClearanceCount + RejectedJumpSpeedCount + RejectedJumpInvalidCount) > 0)
         {
             GenerationStatus = FText::FromString(TEXT("No links generated. Jump validation rejected the candidate jump directions. Clear obstacles, increase Jump Apex Height, or adjust the advanced jump validation settings."));
         }
@@ -1581,10 +1656,20 @@ void AOmniSplineNavLink::UpdateGenerationStatus()
 
     if (bValidateJumpPath && (UsesTraversalAction(EOmniTraversalAction::Jump) || UsesTraversalAction(EOmniTraversalAction::Automatic)))
     {
-        const int32 RejectedJumpDirections = RejectedJumpArcCount + RejectedJumpSpeedCount;
+        const int32 RejectedJumpDirections = (RejectedJumpDepartureSupportCount + RejectedJumpDepartureClearanceCount + RejectedJumpPathCount + RejectedJumpLandingSupportCount + RejectedJumpLandingClearanceCount + RejectedJumpSpeedCount + RejectedJumpInvalidCount);
         if (RejectedJumpDirections > 0)
         {
-            Status += FString::Printf(TEXT(" %d jump direction%s rejected by path validation."), RejectedJumpDirections, RejectedJumpDirections == 1 ? TEXT(" was") : TEXT("s were"));
+            Status += FString::Printf(
+                TEXT(" %d jump direction%s rejected (departure support %d, departure clearance %d, path %d, landing support %d, landing clearance %d, speed %d, invalid %d)."),
+                RejectedJumpDirections,
+                RejectedJumpDirections == 1 ? TEXT(" was") : TEXT("s were"),
+                RejectedJumpDepartureSupportCount,
+                RejectedJumpDepartureClearanceCount,
+                RejectedJumpPathCount,
+                RejectedJumpLandingSupportCount,
+                RejectedJumpLandingClearanceCount,
+                RejectedJumpSpeedCount,
+                RejectedJumpInvalidCount);
         }
         if (JumpRestrictedToOneWayCount > 0)
         {
@@ -1594,9 +1679,19 @@ void AOmniSplineNavLink::UpdateGenerationStatus()
 
     if (bValidateMantlePath && (UsesTraversalAction(EOmniTraversalAction::Mantle) || UsesTraversalAction(EOmniTraversalAction::Automatic)))
     {
-        if (RejectedMantlePathCount > 0)
+        const int32 RejectedMantleDirections = (RejectedMantleDepartureSupportCount + RejectedMantleDepartureClearanceCount + RejectedMantlePathCount + RejectedMantleLandingSupportCount + RejectedMantleLandingClearanceCount + RejectedMantleInvalidCount);
+        if (RejectedMantleDirections > 0)
         {
-            Status += FString::Printf(TEXT(" %d mantle direction%s rejected by path validation."), RejectedMantlePathCount, RejectedMantlePathCount == 1 ? TEXT(" was") : TEXT("s were"));
+            Status += FString::Printf(
+                TEXT(" %d mantle direction%s rejected (departure support %d, departure clearance %d, path %d, landing support %d, landing clearance %d, invalid %d)."),
+                RejectedMantleDirections,
+                RejectedMantleDirections == 1 ? TEXT(" was") : TEXT("s were"),
+                RejectedMantleDepartureSupportCount,
+                RejectedMantleDepartureClearanceCount,
+                RejectedMantlePathCount,
+                RejectedMantleLandingSupportCount,
+                RejectedMantleLandingClearanceCount,
+                RejectedMantleInvalidCount);
         }
         if (MantleRestrictedToOneWayCount > 0)
         {
@@ -1677,10 +1772,20 @@ void AOmniSplineNavLink::ResetDebugCounters()
     AutomaticMantlePromotionCount = 0;
     AutomaticMantleValidationFallbackCount = 0;
     AutomaticMantleLedgeFallbackCount = 0;
-    RejectedJumpArcCount = 0;
+    RejectedJumpDepartureSupportCount = 0;
+    RejectedJumpDepartureClearanceCount = 0;
+    RejectedJumpPathCount = 0;
+    RejectedJumpLandingSupportCount = 0;
+    RejectedJumpLandingClearanceCount = 0;
     RejectedJumpSpeedCount = 0;
+    RejectedJumpInvalidCount = 0;
     JumpRestrictedToOneWayCount = 0;
+    RejectedMantleDepartureSupportCount = 0;
+    RejectedMantleDepartureClearanceCount = 0;
     RejectedMantlePathCount = 0;
+    RejectedMantleLandingSupportCount = 0;
+    RejectedMantleLandingClearanceCount = 0;
+    RejectedMantleInvalidCount = 0;
     MantleRestrictedToOneWayCount = 0;
     MergedDuplicateCount = 0;
     bSampleCapReached = false;
@@ -1704,6 +1809,24 @@ void AOmniSplineNavLink::DrawEditorPreview() const
     const FVector PreviewOffset(0.0, 0.0, 8.0);
     const bool bDrawSamples = PreviewDetail != EOmniPreviewDetail::LinksOnly;
     const bool bDrawDiagnostics = PreviewDetail == EOmniPreviewDetail::Diagnostics;
+
+    auto GetValidationReason = [](uint8 FailureCode, bool bSpeedFailure) -> FString
+    {
+        if (bSpeedFailure)
+        {
+            return TEXT("Horizontal Speed");
+        }
+
+        switch (FailureCode)
+        {
+        case 1: return TEXT("Departure Support");
+        case 2: return TEXT("Departure Clearance");
+        case 3: return TEXT("Path Blocked");
+        case 4: return TEXT("Landing Support");
+        case 5: return TEXT("Landing Clearance");
+        default: return TEXT("Invalid");
+        }
+    };
 
     if (bDrawSamples)
     {
@@ -1741,6 +1864,11 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 1.5f,
                 PreviewOffset);
         }
+
+        if (Pair.bAutomaticMantleFallback)
+        {
+            OmniPreview::DrawFallbackMarker(World, Pair.SourceWorld, Pair.TargetWorld, PreviewOffset);
+        }
     }
 
     if (bDrawDiagnostics)
@@ -1759,6 +1887,23 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 2.0f,
                 PreviewOffset,
                 &RejectedColor);
+            OmniPreview::DrawRejectedReasonLabel(
+                World,
+                Pair.SourceWorld,
+                Pair.TargetWorld,
+                Pair.NativeDirection,
+                GetValidationReason(Pair.ValidationFailureCode, Pair.bValidationSpeedFailure),
+                PreviewOffset);
+            OmniPreview::DrawRejectedFailureMarker(
+                World,
+                Pair.SourceWorld,
+                Pair.TargetWorld,
+                Pair.NativeDirection,
+                Pair.ValidationFailureCode,
+                Pair.bValidationSpeedFailure,
+                false,
+                JumpApexHeight,
+                PreviewOffset);
         }
 
         for (const FProjectedPair& Pair : PreviewRejectedMantlePairs)
@@ -1773,6 +1918,23 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 2.0f,
                 PreviewOffset,
                 &RejectedColor);
+            OmniPreview::DrawRejectedReasonLabel(
+                World,
+                Pair.SourceWorld,
+                Pair.TargetWorld,
+                Pair.NativeDirection,
+                GetValidationReason(Pair.ValidationFailureCode, false),
+                PreviewOffset);
+            OmniPreview::DrawRejectedFailureMarker(
+                World,
+                Pair.SourceWorld,
+                Pair.TargetWorld,
+                Pair.NativeDirection,
+                Pair.ValidationFailureCode,
+                false,
+                true,
+                MantleArcHeight,
+                PreviewOffset);
         }
     }
 }

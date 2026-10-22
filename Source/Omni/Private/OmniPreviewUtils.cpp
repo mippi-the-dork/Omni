@@ -6,6 +6,58 @@
 
 namespace
 {
+    void DrawArrowhead(
+        UWorld* World,
+        const FVector& Start,
+        const FVector& End,
+        const FColor& Color,
+        float Thickness)
+    {
+        if (!World)
+        {
+            return;
+        }
+
+        const FVector Direction = (End - Start).GetSafeNormal();
+        if (Direction.IsNearlyZero())
+        {
+            return;
+        }
+
+        FVector Side = FVector::CrossProduct(Direction, FVector::UpVector).GetSafeNormal();
+        if (Side.IsNearlyZero())
+        {
+            Side = FVector::CrossProduct(Direction, FVector::RightVector).GetSafeNormal();
+        }
+
+        constexpr float ArrowLength = 14.0f;
+        constexpr float ArrowWidth = 7.0f;
+        const FVector Base = End - Direction * ArrowLength;
+        DrawDebugLine(World, End, Base + Side * ArrowWidth, Color, false, -1.0f, 0, Thickness);
+        DrawDebugLine(World, End, Base - Side * ArrowWidth, Color, false, -1.0f, 0, Thickness);
+    }
+
+    void DrawDirectionalArrowheads(
+        UWorld* World,
+        const FVector& Source,
+        const FVector& Target,
+        ENavLinkDirection::Type Direction,
+        const FColor& Color,
+        float Thickness)
+    {
+        if (Direction == ENavLinkDirection::RightToLeft)
+        {
+            DrawArrowhead(World, Target, Source, Color, Thickness);
+            return;
+        }
+
+        DrawArrowhead(World, Source, Target, Color, Thickness);
+        if (Direction == ENavLinkDirection::BothWays)
+        {
+            DrawArrowhead(World, Target, Source, Color, Thickness);
+        }
+    }
+
     void DrawBallisticArc(
         UWorld* World,
         const FVector& Start,
@@ -55,22 +107,34 @@ namespace OmniPreview
         return FColor(255, 160, 60);
     }
 
+    FColor NativeColor()
+    {
+        return FColor(110, 255, 130);
+    }
+
+    FColor JumpColor()
+    {
+        return FColor(255, 220, 80);
+    }
+
+    FColor MantleColor()
+    {
+        return FColor(80, 200, 255);
+    }
+
+    FColor CustomColor()
+    {
+        return FColor(220, 100, 255);
+    }
+
+    FColor FallbackColor()
+    {
+        return FColor(255, 145, 40);
+    }
+
     FColor RejectedColor()
     {
         return FColor(255, 70, 70);
-    }
-
-    FColor DirectionColor(ENavLinkDirection::Type Direction)
-    {
-        if (Direction == ENavLinkDirection::LeftToRight)
-        {
-            return FColor(255, 220, 80);
-        }
-        if (Direction == ENavLinkDirection::RightToLeft)
-        {
-            return FColor(220, 100, 255);
-        }
-        return FColor(110, 255, 130);
     }
 
     void DrawSamplePoint(UWorld* World, const FVector& WorldPoint, const FColor& Color, float PointSize, const FVector& Offset)
@@ -79,6 +143,108 @@ namespace OmniPreview
         {
             DrawDebugPoint(World, WorldPoint + Offset, PointSize, Color, false, -1.0f, 0);
         }
+    }
+
+    void DrawFallbackMarker(UWorld* World, const FVector& SourceWorld, const FVector& TargetWorld, const FVector& Offset)
+    {
+        if (!World)
+        {
+            return;
+        }
+
+        const FVector Center = FMath::Lerp(SourceWorld, TargetWorld, 0.5f) + Offset + FVector(0.0, 0.0, 6.0);
+        DrawDebugPoint(World, Center, 12.0f, FallbackColor(), false, -1.0f, 0);
+    }
+
+    void DrawRejectedReasonLabel(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        const FString& Reason,
+        const FVector& Offset)
+    {
+        if (!World || Reason.IsEmpty())
+        {
+            return;
+        }
+
+        const FVector DirectionVector = (TargetWorld - SourceWorld).GetSafeNormal();
+        FVector Side = FVector::CrossProduct(DirectionVector, FVector::UpVector).GetSafeNormal();
+        if (Side.IsNearlyZero())
+        {
+            Side = FVector::RightVector;
+        }
+
+        const float SideSign = Direction == ENavLinkDirection::RightToLeft ? -1.0f : 1.0f;
+        const FVector LabelLocation = FMath::Lerp(SourceWorld, TargetWorld, 0.5f) + Offset + Side * (18.0f * SideSign) + FVector(0.0f, 0.0f, 18.0f);
+        const TCHAR* DirectionPrefix = Direction == ENavLinkDirection::RightToLeft ? TEXT("T->S: ") : TEXT("S->T: ");
+        DrawDebugString(World, LabelLocation, FString(DirectionPrefix) + Reason, nullptr, RejectedColor(), 0.0f, false, 1.0f);
+    }
+
+    void DrawRejectedFailureMarker(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        uint8 FailureCode,
+        bool bSpeedFailure,
+        bool bMantleTraversal,
+        float ArcHeight,
+        const FVector& Offset)
+    {
+        if (!World)
+        {
+            return;
+        }
+
+        const bool bReverse = Direction == ENavLinkDirection::RightToLeft;
+        const FVector Start = bReverse ? TargetWorld : SourceWorld;
+        const FVector End = bReverse ? SourceWorld : TargetWorld;
+
+        FVector MarkerLocation = FMath::Lerp(Start, End, 0.5f);
+        if (!bSpeedFailure)
+        {
+            switch (FailureCode)
+            {
+            case 1: // Departure support
+            case 2: // Departure clearance
+                MarkerLocation = Start;
+                break;
+
+            case 4: // Landing support
+            case 5: // Landing clearance
+                MarkerLocation = End;
+                break;
+
+            case 3: // Travel path
+                if (bMantleTraversal)
+                {
+                    MarkerLocation = OmniTraversal::CalculateMantlePathPoint(Start, End, 0.5f, ArcHeight);
+                }
+                else
+                {
+                    FVector LaunchVelocity = FVector::ZeroVector;
+                    float TotalTime = 0.0f;
+                    constexpr float StandardGravityMagnitude = 980.0f;
+                    if (OmniTraversal::CalculateBallisticLaunch(Start, End, ArcHeight, StandardGravityMagnitude, LaunchVelocity, TotalTime))
+                    {
+                        const float Time = TotalTime * 0.5f;
+                        MarkerLocation = Start + LaunchVelocity * Time;
+                        MarkerLocation.Z -= 0.5f * StandardGravityMagnitude * Time * Time;
+                    }
+                }
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        MarkerLocation += Offset;
+        const FColor Color = RejectedColor();
+        DrawDebugSphere(World, MarkerLocation, 8.0f, 8, Color, false, -1.0f, 0, 1.5f);
+        DrawDebugPoint(World, MarkerLocation, 10.0f, Color, false, -1.0f, 0);
     }
 
     void DrawTraversal(
@@ -98,19 +264,21 @@ namespace OmniPreview
             return;
         }
 
-        const FColor Color = OverrideColor ? *OverrideColor : DirectionColor(Direction);
+        const FColor Color = OverrideColor ? *OverrideColor : (bUsesJumpTraversal ? JumpColor() : NativeColor());
         const FVector Source = SourceWorld + Offset;
         const FVector Target = TargetWorld + Offset;
 
         if (!bUsesJumpTraversal)
         {
             DrawDebugLine(World, Source, Target, Color, false, -1.0f, 0, LineThickness);
+            DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
             return;
         }
 
         if (Direction == ENavLinkDirection::RightToLeft)
         {
             DrawBallisticArc(World, Target, Source, Color, JumpApexHeight, JumpArcSegments, LineThickness);
+            DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
             return;
         }
 
@@ -119,6 +287,7 @@ namespace OmniPreview
         {
             DrawBallisticArc(World, Target, Source, Color, JumpApexHeight, JumpArcSegments, LineThickness);
         }
+        DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
     }
     void DrawMantleTraversal(
         UWorld* World,
@@ -138,7 +307,7 @@ namespace OmniPreview
 
         const FVector Source = SourceWorld + Offset;
         const FVector Target = TargetWorld + Offset;
-        const FColor Color = OverrideColor ? *OverrideColor : DirectionColor(Direction);
+        const FColor Color = OverrideColor ? *OverrideColor : MantleColor();
         const int32 SegmentCount = FMath::Clamp(PathSegments, 6, 64);
 
         auto DrawArc = [&](const FVector& Start, const FVector& End, const FVector& SideOffset)
@@ -157,6 +326,7 @@ namespace OmniPreview
         if (Direction == ENavLinkDirection::RightToLeft)
         {
             DrawArc(Target, Source, FVector::ZeroVector);
+            DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
             return;
         }
 
@@ -166,6 +336,7 @@ namespace OmniPreview
             const FVector SideOffset = FVector::CrossProduct((Target - Source).GetSafeNormal(), FVector::UpVector).GetSafeNormal() * 4.0f;
             DrawArc(Target, Source, SideOffset);
         }
+        DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
     }
 
     void DrawCustomTraversal(
@@ -183,7 +354,7 @@ namespace OmniPreview
 
         const FVector Source = SourceWorld + Offset;
         const FVector Target = TargetWorld + Offset;
-        const FColor Color = DirectionColor(Direction);
+        const FColor Color = CustomColor();
         constexpr int32 DashSegments = 16;
 
         auto DrawDashed = [&](const FVector& Start, const FVector& End)
@@ -199,6 +370,7 @@ namespace OmniPreview
         if (Direction == ENavLinkDirection::RightToLeft)
         {
             DrawDashed(Target, Source);
+            DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
             return;
         }
 
@@ -208,6 +380,7 @@ namespace OmniPreview
             const FVector SideOffset = FVector::CrossProduct((Target - Source).GetSafeNormal(), FVector::UpVector).GetSafeNormal() * 4.0f;
             DrawDashed(Target + SideOffset, Source + SideOffset);
         }
+        DrawDirectionalArrowheads(World, Source, Target, Direction, Color, LineThickness);
     }
 
 }

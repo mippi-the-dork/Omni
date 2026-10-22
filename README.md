@@ -4,9 +4,9 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.21.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.28.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build tightens **Automatic Mantle ledge validation** across Point, Volume, and Spline. With **Auto Require Ledge Geometry** enabled, a short upward crossing must now have both a plausible WorldStatic face and a usable top immediately beyond that face. Thin walls, lips with no landing surface, steep tops, and tops without enough standing clearance fall back to Jump instead of being advertised as Mantles. Explicit Mantle remains designer-authoritative.
+This development build adds rejected-traversal failure markers to the editor preview. In **Diagnostics** preview mode, every rejected Jump or Mantle direction keeps its directional reason label and now also receives a compact red marker at the relevant stage of the traversal. Departure failures mark the directional start, landing failures mark the directional destination, and path failures mark the rejected movement path. Speed and invalid/setup failures use the path center as a non-geometric diagnostic marker. Point, Volume, and Spline share the same visualization. Traversal acceptance rules are unchanged.
 
 ### Built-in Mantle Traversal
 
@@ -14,7 +14,7 @@ Set **Traversal Action = Mantle** when a crossing should use Omni's built-in led
 
 The built-in Mantle runtime targets `ACharacter`. When path following reaches the smart link, Omni temporarily switches Character Movement to Flying, moves the Character along a controlled three-stage swept path, restores the previous movement mode, and resumes path following. The path lifts first, traverses toward the ledge top, then settles onto the destination. Sweep movement is used so a blocked runtime path does not intentionally teleport through world geometry.
 
-Before publishing a built-in Mantle link, Omni can now sweep the configured traversal capsule along that same three-stage path. **Validate Mantle Path** is enabled by default. A blocked explicit Mantle direction is rejected, a blocked bidirectional Mantle can reduce to one-way, and a blocked Automatic Mantle candidate falls back to Jump so the existing ballistic validator can test an alternate route. Diagnostics preview rejected Mantle paths in red.
+Before publishing a built-in Mantle link, Omni sweeps the configured traversal capsule along that same three-stage path and validates both traversal endpoints. The departure must provide credible capsule support plus short approach clearance behind the start, while the destination must provide landing support plus short inward recovery clearance. **Validate Mantle Path** is enabled by default. A blocked explicit Mantle direction is rejected, a blocked bidirectional Mantle can reduce to one-way, and a blocked Automatic Mantle candidate falls back to Jump so the existing ballistic validator can test an alternate route. Diagnostics preview rejected Mantle paths or invalid endpoints in red.
 
 Automatic can classify a short upward ledge as Mantle when **Auto Use Mantle** is enabled, the rise is above **Auto Rise Threshold**, the rise is at or below **Auto Mantle Max Height**, the horizontal reach is at or below **Auto Mantle Max Reach**, and native validation reports missing support or an oversized step. **Auto Require Ledge Geometry** is enabled by default. Omni first requires a WorldStatic face that substantially opposes travel, then probes roughly one traversal-agent radius beyond that face toward the elevated destination. That top probe must find support near the destination height, the support must be within the configured Automatic ground-slope limit, and an upright traversal capsule must fit there. A dimensionally mantle-sized crossing that fails this ledge-geometry test falls back to Jump. Larger or longer unsupported upward crossings continue to use Jump. Level gaps remain Jump, and eligible short downward drops remain Native.
 
@@ -22,7 +22,7 @@ Mantle-specific controls are **Mantle Duration**, **Mantle Arc Height**, **Valid
 
 Built-in Mantle is intentionally animation-agnostic. Projects that need root motion, motion matching, gameplay ability integration, hand placement, bespoke collision logic, or authored mantle animations should continue to use **Custom** traversal.
 
-See `Doc/Mantle-Traversal-Test-Plan.md` for runtime traversal coverage, `Doc/Mantle-Validation-Test-Plan.md` for generation-time path validation, and `Doc/Automatic-Mantle-Ledge-Geometry-Test-Plan.md` for the current Automatic ledge-geometry pass. The 0.20 face-only regression plan remains in `Doc/Automatic-Mantle-Ledge-Test-Plan.md`.
+See `Doc/Rejected-Traversal-Failure-Markers-Test-Plan.md` for the 0.28 failure-marker pass, `Doc/Rejected-Traversal-Labels-Test-Plan.md` for the 0.27 viewport-diagnostics pass, `Doc/Preview-Visual-Language-Test-Plan.md` for the 0.26 preview pass, `Doc/Traversal-Validation-Diagnostics-Test-Plan.md` for the 0.25 diagnostics pass, `Doc/Traversal-Departure-Validation-Test-Plan.md` for the 0.24 departure pass, `Doc/Traversal-Landing-Recovery-Test-Plan.md` for the 0.23 landing-recovery pass, `Doc/Traversal-Landing-Validation-Test-Plan.md` for the 0.22 landing-support pass, `Doc/Mantle-Traversal-Test-Plan.md` for runtime traversal coverage, `Doc/Mantle-Validation-Test-Plan.md` for generation-time path validation, and `Doc/Automatic-Mantle-Ledge-Geometry-Test-Plan.md` for the Automatic ledge-geometry pass. The 0.20 face-only regression plan remains in `Doc/Automatic-Mantle-Ledge-Test-Plan.md`.
 
 ### Custom Traversal Context
 
@@ -83,7 +83,7 @@ Move the Pawn using your own logic, then call **Complete Custom Traversal** on t
 
 **Custom Traversal Timeout** defaults to 5 seconds and prevents a forgotten completion call from holding path following forever. If no listener is bound when the AI reaches the link, Omni releases the link immediately rather than deadlocking the path follower.
 
-Custom links are drawn as dashed traversal lines in the editor preview. Direction colors remain the normal Omni green, yellow, and purple convention.
+Custom links are drawn as dashed purple traversal lines in the editor preview. Preview color communicates traversal type, while arrowheads communicate direction.
 
 See `Doc/Custom-Traversal-Test-Plan.md` for the dedicated test pass.
 
@@ -93,9 +93,9 @@ All three Omni authoring actors now expose **Preview Detail** under **Omni > Vis
 
 - **Links Only** draws only the generated traversal links.
 - **Samples + Links** is the default and also draws projected Source/Target NavMesh samples.
-- **Diagnostics** adds rejected Jump trajectories as red arcs.
+- **Diagnostics** adds rejected Jump and Mantle trajectories in red and labels each rejected direction with its first failing validation stage.
 
-Jump preview direction is exact across Point, Volume, and Spline. Target-to-Source jumps draw from Target toward Source, and Both Ways jumps draw both ballistic arcs when the two directions differ by height. Preview arc resolution follows **Jump Validation Segments**. Mantle preview uses the same controlled path helper as runtime movement and also respects the actual generated direction.
+Jump path validation also requires a supported landing footprint at the destination, using the configured Traversal Agent Radius. Jump preview direction is exact across Point, Volume, and Spline. Target-to-Source jumps draw from Target toward Source, and Both Ways jumps draw both ballistic arcs when the two directions differ by height. Preview arc resolution follows **Jump Validation Segments**. Mantle preview uses the same controlled path helper as runtime movement and also respects the actual generated direction.
 
 ## Omni Point NavLink
 
@@ -119,7 +119,7 @@ Under **Actions**:
 
 Under **Status**, Omni reports **Generated Links**, **Native Links**, **Jump Links**, **Mantle Links**, **Custom Links**, **Source On NavMesh**, and **Target On NavMesh**. A Both Ways Point link can produce two internal one-way links when Automatic resolves its two directions to different traversal types.
 
-With **Show Preview** enabled, **Preview Detail** controls how much is drawn. Samples + Links shows the projected Source and Target locations as cyan and orange points. Native traversal is drawn as a straight line, Jump traversal as a ballistic arc, and Mantle traversal as a compact controlled arc. Diagnostics additionally shows rejected jumps as red arcs. Green, yellow, and purple retain the same Both Ways, Source to Target, and Target to Source meaning used by Volume and Spline.
+With **Show Preview** enabled, **Preview Detail** controls how much is drawn. Samples + Links shows the projected Source and Target locations as cyan and orange points. Native traversal is drawn as a straight line, Jump traversal as a ballistic arc, and Mantle traversal as a compact controlled arc. Diagnostics additionally shows rejected jumps as red arcs. Color communicates traversal type: Native is green, Jump is yellow, Mantle is cyan, and Custom is purple. Arrowheads communicate direction, with an arrow at each end for Both Ways. Automatic Mantle fallbacks that successfully become Jump links receive a small orange midpoint marker.
 
 The advanced projection, Nav Area, supported-agent, Automatic validation, Jump validation, height-limit, and path-cost controls match the corresponding Omni Volume and Spline behavior.
 
@@ -174,7 +174,7 @@ The normal setup controls are intentionally small:
 - **Custom Spacing**: only appears when Coverage Density is Custom.
 - **Max Crossing Distance**: longest connection Omni is allowed to generate. Zero disables the limit.
 
-The **Visualization** category contains **Show Preview** and **Preview Detail**. With the actor selected, cyan points are valid Source NavMesh samples and orange points are valid Target NavMesh samples. Native links are drawn as straight lines, Jump links as ballistic arcs, Mantle links as compact controlled arcs, and Custom links as dashed lines. Link color communicates direction: green for Both Ways, yellow for Source to Target, and purple for Target to Source. **Diagnostics** preview detail additionally draws rejected Jump directions as red arcs.
+The **Visualization** category contains **Show Preview** and **Preview Detail**. With the actor selected, cyan points are valid Source NavMesh samples and orange points are valid Target NavMesh samples. Native links are drawn as straight lines, Jump links as ballistic arcs, Mantle links as compact controlled arcs, and Custom links as dashed lines. Link color communicates traversal type: green for Native, yellow for Jump, cyan for Mantle, and purple for Custom. Arrowheads communicate direction, with arrows at both ends for Both Ways. **Diagnostics** preview detail additionally draws rejected Jump and Mantle directions in red.
 
 The **Actions** category provides:
 
@@ -196,7 +196,7 @@ The Status category now reports plain-English feedback such as:
 - generated-link cap reached
 - grid safety cap reached
 
-Low-level counters remain under **Diagnostics** for troubleshooting.
+Low-level counters remain under **Diagnostics** for troubleshooting. Jump and Mantle rejection counters now identify the first failed validation stage: **Departure Support**, **Departure Clearance**, **Path**, **Landing Support**, **Landing Clearance**, and **Invalid**. Jump also reports **Speed** separately. A rejected direction contributes to exactly one reason counter, which keeps totals readable and prevents one bad link from inflating several diagnostics at once.
 
 ### Diagnostic counters
 
@@ -245,7 +245,7 @@ The normal Spline setup controls are:
 - **Custom Spacing**: only appears when Coverage Density is Custom
 - **Max Crossing Distance**
 
-With **Show Preview** enabled and the actor selected, **Preview Detail** controls clutter. Samples + Links shows cyan valid Source samples and orange valid Target samples. Native links are straight, Jump links are ballistic arcs, and Mantle links use compact controlled arcs. Green, yellow, and purple communicate Both Ways, Source to Target, and Target to Source respectively. Diagnostics adds rejected Jump arcs in red.
+With **Show Preview** enabled and the actor selected, **Preview Detail** controls clutter. Samples + Links shows cyan valid Source samples and orange valid Target samples. Native links are straight, Jump links are ballistic arcs, and Mantle links use compact controlled arcs. Green, yellow, cyan, and purple communicate Native, Jump, Mantle, and Custom respectively. Arrowheads communicate link direction. Diagnostics adds rejected Jump and Mantle paths in red.
 
 Use **Reset Splines** to return both authoring splines to the default straight parallel layout.
 
@@ -325,7 +325,7 @@ Mantle-specific controls are:
 
 `OmniNavArea_Mantle` defaults to a travel-cost multiplier of 2.25 and a fixed entering cost of 60. This makes Mantle more expensive than ordinary walking by default while still allowing the pathfinder to use it when appropriate.
 
-The editor preview draws Mantle as a compact controlled arc using the same path helper as runtime movement. Direction colors remain green for Both Ways, yellow for Source to Target, and purple for Target to Source.
+The editor preview draws Mantle as a compact controlled arc using the same path helper as runtime movement. Mantle previews are cyan and use arrowheads to communicate direction.
 
 The built-in Mantle implementation is animation-agnostic and targets `ACharacter` with normal world-Z orientation. Use **Custom** when the project needs animation-driven or game-specific mantle behavior. Generation-time validation checks WorldStatic geometry, while runtime swept movement and timeout still protect against dynamic blockers or runtime-only changes.
 
@@ -367,7 +367,7 @@ The event provides **Request Id**, **Pawn**, **Start**, and **Destination**. You
 
 **Custom Traversal Timeout** defaults to 5 seconds. If the completion call is missed, Omni eventually releases path following as a safety fallback. If there is no listener bound at all, Omni releases immediately instead of leaving the AI stuck.
 
-Custom uses the actor's normal **Area Class** and **Supported Agents** settings. In the editor preview, Custom links are dashed while preserving the same direction colors used by Native, Jump, and Mantle links.
+Custom uses the actor's normal **Area Class** and **Supported Agents** settings. In the editor preview, Custom links are dashed purple lines and use the same arrowhead direction language as Native, Jump, and Mantle links.
 
 The Status category now separates:
 
@@ -389,11 +389,15 @@ The limits are directional. A pair that drops 250 cm from Source to Target rises
 
 Height filtering applies to Native Movement, Jump, Mantle, Automatic, and Custom. Pair search is height-aware, so Nearest and Matched Grid try another valid sample when the geometrically preferred match violates Max Crossing Distance or the active height limits.
 
-Viewport preview link colors communicate the actual generated direction:
+Viewport preview colors communicate the actual generated traversal type:
 
-- Green: Both Ways
-- Yellow: Source to Target
-- Purple: Target to Source
+- Green: Native
+- Yellow: Jump
+- Cyan: Mantle
+- Purple: Custom
+- Red: Rejected traversal candidate in Diagnostics
+
+Arrowheads communicate direction. One arrowhead marks a one-way traversal, while Both Ways displays an arrowhead at each end. Automatic Mantle fallbacks that successfully resolve to Jump also receive a small orange midpoint marker.
 
 Status reports when height limits reduce otherwise bidirectional pairs to one-way links. Diagnostics includes **Height Limited To One Way**.
 
