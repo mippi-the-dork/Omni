@@ -1,23 +1,23 @@
 {
-  "FileVersion": 3,
-  "Version": 28,
-  "VersionName": "0.28.0",
-  "FriendlyName": "Omni",
-  "Description": "Enhanced point, volume, and spline navigation links with Native, Jump, Mantle, Automatic, Custom, directional traversal, generation-time traversal validation, path costs, height-aware filtering, and live previews.",
-  "Category": "AI",
-  "CreatedBy": "Mippi the Dork",
-  "EngineVersion": "5.8.0",
-  "CanContainContent": false,
-  "IsBetaVersion": true,
-  "Installed": false,
-  "SupportedTargetPlatforms": [
-    "Win64"
-  ],
-  "Modules": [
-    {
-      "Name": "Omni",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
-    }
-  ]
+    "FileVersion": 3,
+    "Version": 39,
+    "VersionName": "0.39.0",
+    "FriendlyName": "Omni",
+    "Description": "Enhanced point, volume, and spline navigation links with Native, Jump, Mantle, Automatic, Custom, directional traversal, generation-time traversal validation, path costs, height-aware filtering, and live previews.",
+    "Category": "AI",
+    "CreatedBy": "Mippi the Dork",
+    "EngineVersion": "5.8.0",
+    "CanContainContent": false,
+    "IsBetaVersion": true,
+    "Installed": false,
+    "SupportedTargetPlatforms": [
+        "Win64"
+    ],
+    "Modules": [
+        {
+            "Name": "Omni",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        }
+    ]
 }

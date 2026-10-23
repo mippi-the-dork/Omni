@@ -222,7 +222,9 @@ namespace OmniTraversal
         const AActor* IgnoreActor,
         const FVector& StartFeetWorld,
         const FVector& EndFeetWorld,
-        const FOmniMantleValidationSettings& Settings);
+        const FOmniMantleValidationSettings& Settings,
+        FVector* OutBlockingLocation = nullptr,
+        FString* OutBlockingObject = nullptr);
 
     /**
      * Calculates a ballistic launch velocity that reaches End from Start while
@@ -246,5 +248,7 @@ namespace OmniTraversal
         const AActor* IgnoreActor,
         const FVector& StartFeetWorld,
         const FVector& EndFeetWorld,
-        const FOmniJumpValidationSettings& Settings);
+        const FOmniJumpValidationSettings& Settings,
+        FVector* OutBlockingLocation = nullptr,
+        FString* OutBlockingObject = nullptr);
 }

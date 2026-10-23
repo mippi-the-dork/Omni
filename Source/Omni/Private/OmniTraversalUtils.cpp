@@ -2,6 +2,8 @@
 
 #include "CollisionQueryParams.h"
 #include "CollisionShape.h"
+#include "Components/PrimitiveComponent.h"
+#include "Engine/OverlapResult.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 
@@ -113,8 +115,19 @@ namespace
         const FVector& StartFeetWorld,
         const FVector& EndFeetWorld,
         float AgentRadius,
-        float AgentHalfHeight)
+        float AgentHalfHeight,
+        FVector* OutBlockingLocation = nullptr,
+        FString* OutBlockingObject = nullptr)
     {
+        if (OutBlockingLocation)
+        {
+            *OutBlockingLocation = FVector::ZeroVector;
+        }
+        if (OutBlockingObject)
+        {
+            OutBlockingObject->Reset();
+        }
+
         if (!World || StartFeetWorld.ContainsNaN() || EndFeetWorld.ContainsNaN())
         {
             return false;
@@ -145,12 +158,50 @@ namespace
             QueryParams.AddIgnoredActor(IgnoreActor);
         }
 
-        if (World->OverlapBlockingTestByChannel(
-                LandingCenter,
-                FQuat::Identity,
-                ECC_WorldStatic,
-                AgentShape,
-                QueryParams))
+        auto CaptureOverlapBlocker = [&](const FVector& TestCenter) -> bool
+        {
+            TArray<FOverlapResult> Overlaps;
+            if (!World->OverlapMultiByChannel(
+                    Overlaps,
+                    TestCenter,
+                    FQuat::Identity,
+                    ECC_WorldStatic,
+                    AgentShape,
+                    QueryParams))
+            {
+                return false;
+            }
+
+            for (const FOverlapResult& Overlap : Overlaps)
+            {
+                if (!Overlap.bBlockingHit)
+                {
+                    continue;
+                }
+
+                UPrimitiveComponent* Component = Overlap.GetComponent();
+                AActor* Actor = Overlap.GetActor();
+                if (OutBlockingLocation)
+                {
+                    *OutBlockingLocation = Component
+                        ? Component->Bounds.GetBox().GetClosestPointTo(TestCenter)
+                        : TestCenter;
+                }
+                if (OutBlockingObject)
+                {
+                    const FString ActorName = GetNameSafe(Actor);
+                    const FString ComponentName = GetNameSafe(Component);
+                    *OutBlockingObject = !ActorName.IsEmpty() && !ComponentName.IsEmpty()
+                        ? FString::Printf(TEXT("%s.%s"), *ActorName, *ComponentName)
+                        : (!ActorName.IsEmpty() ? ActorName : ComponentName);
+                }
+                return true;
+            }
+
+            return false;
+        };
+
+        if (CaptureOverlapBlocker(LandingCenter))
         {
             return false;
         }
@@ -160,12 +211,7 @@ namespace
             return true;
         }
 
-        if (World->OverlapBlockingTestByChannel(
-                RecoveryCenter,
-                FQuat::Identity,
-                ECC_WorldStatic,
-                AgentShape,
-                QueryParams))
+        if (CaptureOverlapBlocker(RecoveryCenter))
         {
             return false;
         }
@@ -180,6 +226,18 @@ namespace
                 AgentShape,
                 QueryParams))
         {
+            if (OutBlockingLocation)
+            {
+                *OutBlockingLocation = RecoveryHit.ImpactPoint.IsNearlyZero() ? RecoveryHit.Location : RecoveryHit.ImpactPoint;
+            }
+            if (OutBlockingObject)
+            {
+                const FString ActorName = GetNameSafe(RecoveryHit.GetActor());
+                const FString ComponentName = GetNameSafe(RecoveryHit.GetComponent());
+                *OutBlockingObject = !ActorName.IsEmpty() && !ComponentName.IsEmpty()
+                    ? FString::Printf(TEXT("%s.%s"), *ActorName, *ComponentName)
+                    : (!ActorName.IsEmpty() ? ActorName : ComponentName);
+            }
             return false;
         }
 
@@ -824,8 +882,19 @@ namespace OmniTraversal
         const AActor* IgnoreActor,
         const FVector& StartFeetWorld,
         const FVector& EndFeetWorld,
-        const FOmniMantleValidationSettings& Settings)
+        const FOmniMantleValidationSettings& Settings,
+        FVector* OutBlockingLocation,
+        FString* OutBlockingObject)
     {
+        if (OutBlockingLocation)
+        {
+            *OutBlockingLocation = FVector::ZeroVector;
+        }
+        if (OutBlockingObject)
+        {
+            OutBlockingObject->Reset();
+        }
+
         if (!Settings.bValidatePath)
         {
             return EOmniMantleValidationResult::Valid;
@@ -856,7 +925,9 @@ namespace OmniTraversal
                 EndFeetWorld,
                 StartFeetWorld,
                 SafeRadius,
-                SafeHalfHeight))
+                SafeHalfHeight,
+                OutBlockingLocation,
+                OutBlockingObject))
         {
             return EOmniMantleValidationResult::DepartureClearance;
         }
@@ -885,6 +956,18 @@ namespace OmniTraversal
                     AgentShape,
                     QueryParams))
             {
+                if (OutBlockingLocation)
+                {
+                    *OutBlockingLocation = Hit.ImpactPoint.IsNearlyZero() ? Hit.Location : Hit.ImpactPoint;
+                }
+                if (OutBlockingObject)
+                {
+                    const FString ActorName = GetNameSafe(Hit.GetActor());
+                    const FString ComponentName = GetNameSafe(Hit.GetComponent());
+                    *OutBlockingObject = !ActorName.IsEmpty() && !ComponentName.IsEmpty()
+                        ? FString::Printf(TEXT("%s.%s"), *ActorName, *ComponentName)
+                        : (!ActorName.IsEmpty() ? ActorName : ComponentName);
+                }
                 return EOmniMantleValidationResult::PathBlocked;
             }
 
@@ -902,7 +985,9 @@ namespace OmniTraversal
                 StartFeetWorld,
                 EndFeetWorld,
                 SafeRadius,
-                SafeHalfHeight))
+                SafeHalfHeight,
+                OutBlockingLocation,
+                OutBlockingObject))
         {
             return EOmniMantleValidationResult::LandingClearance;
         }
@@ -943,8 +1028,19 @@ namespace OmniTraversal
         const AActor* IgnoreActor,
         const FVector& StartFeetWorld,
         const FVector& EndFeetWorld,
-        const FOmniJumpValidationSettings& Settings)
+        const FOmniJumpValidationSettings& Settings,
+        FVector* OutBlockingLocation,
+        FString* OutBlockingObject)
     {
+        if (OutBlockingLocation)
+        {
+            *OutBlockingLocation = FVector::ZeroVector;
+        }
+        if (OutBlockingObject)
+        {
+            OutBlockingObject->Reset();
+        }
+
         if (!Settings.bValidatePath)
         {
             return EOmniJumpValidationResult::Valid;
@@ -973,7 +1069,9 @@ namespace OmniTraversal
                 EndFeetWorld,
                 StartFeetWorld,
                 SafeRadius,
-                SafeHalfHeight))
+                SafeHalfHeight,
+                OutBlockingLocation,
+                OutBlockingObject))
         {
             return EOmniJumpValidationResult::DepartureClearance;
         }
@@ -1021,6 +1119,18 @@ namespace OmniTraversal
                     AgentShape,
                     QueryParams))
             {
+                if (OutBlockingLocation)
+                {
+                    *OutBlockingLocation = Hit.ImpactPoint.IsNearlyZero() ? Hit.Location : Hit.ImpactPoint;
+                }
+                if (OutBlockingObject)
+                {
+                    const FString ActorName = GetNameSafe(Hit.GetActor());
+                    const FString ComponentName = GetNameSafe(Hit.GetComponent());
+                    *OutBlockingObject = !ActorName.IsEmpty() && !ComponentName.IsEmpty()
+                        ? FString::Printf(TEXT("%s.%s"), *ActorName, *ComponentName)
+                        : (!ActorName.IsEmpty() ? ActorName : ComponentName);
+                }
                 return EOmniJumpValidationResult::PathBlocked;
             }
 
@@ -1038,7 +1148,9 @@ namespace OmniTraversal
                 StartFeetWorld,
                 EndFeetWorld,
                 SafeRadius,
-                SafeHalfHeight))
+                SafeHalfHeight,
+                OutBlockingLocation,
+                OutBlockingObject))
         {
             return EOmniJumpValidationResult::LandingClearance;
         }

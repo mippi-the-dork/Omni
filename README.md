@@ -4,9 +4,17 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.28.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.39.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build adds rejected-traversal failure markers to the editor preview. In **Diagnostics** preview mode, every rejected Jump or Mantle direction keeps its directional reason label and now also receives a compact red marker at the relevant stage of the traversal. Departure failures mark the directional start, landing failures mark the directional destination, and path failures mark the rejected movement path. Speed and invalid/setup failures use the path center as a non-geometric diagnostic marker. Point, Volume, and Spline share the same visualization. Traversal acceptance rules are unchanged.
+This development build is a **dense-generation optimization pass**. Volume and Spline endpoint duplicate suppression now use a regeneration-local spatial bucket keyed from the accepted pair's Source endpoint. A new candidate only searches the 27 neighboring cells that can possibly contain an accepted Source endpoint within **Endpoint Merge Distance**, then runs the same exact Source and Target squared-distance tests used previously. Pairing order, merge tolerance, traversal classification, validation, diagnostics, and generated-link limits are unchanged.
+
+The optimization is most relevant to dense Volume and Filled Area Spline setups, where the previous implementation could scan every already-accepted preview pair for every new candidate. **Last Generation Time**, added in 0.38, remains available under Omni Status so the same actor can be measured before and after the optimization.
+
+Automatic editor regeneration also retains the 0.37 deferred/coalesced behavior: construction, property, and completed-move notifications queue one refresh for the next editor tick, while explicit **Regenerate Link(s)**, **Recheck Diagnostics**, navigation-build regeneration, component registration, Undo/Redo, and authoring actions remain immediate.
+
+**Recheck Diagnostics** remains available on all three actor types to close the diagnose → fix → regenerate → verify loop.
+
+See `Doc/Spatial-Duplicate-Merge-Optimization-Test-Plan.md` for the 0.39 performance regression plan, `Doc/Generation-Performance-Readout-Test-Plan.md` for the 0.38 timing pass, and `Doc/Deferred-Editor-Regeneration-Test-Plan.md` for the 0.37 coalescing pass.
 
 ### Built-in Mantle Traversal
 
@@ -22,7 +30,7 @@ Mantle-specific controls are **Mantle Duration**, **Mantle Arc Height**, **Valid
 
 Built-in Mantle is intentionally animation-agnostic. Projects that need root motion, motion matching, gameplay ability integration, hand placement, bespoke collision logic, or authored mantle animations should continue to use **Custom** traversal.
 
-See `Doc/Rejected-Traversal-Failure-Markers-Test-Plan.md` for the 0.28 failure-marker pass, `Doc/Rejected-Traversal-Labels-Test-Plan.md` for the 0.27 viewport-diagnostics pass, `Doc/Preview-Visual-Language-Test-Plan.md` for the 0.26 preview pass, `Doc/Traversal-Validation-Diagnostics-Test-Plan.md` for the 0.25 diagnostics pass, `Doc/Traversal-Departure-Validation-Test-Plan.md` for the 0.24 departure pass, `Doc/Traversal-Landing-Recovery-Test-Plan.md` for the 0.23 landing-recovery pass, `Doc/Traversal-Landing-Validation-Test-Plan.md` for the 0.22 landing-support pass, `Doc/Mantle-Traversal-Test-Plan.md` for runtime traversal coverage, `Doc/Mantle-Validation-Test-Plan.md` for generation-time path validation, and `Doc/Automatic-Mantle-Ledge-Geometry-Test-Plan.md` for the Automatic ledge-geometry pass. The 0.20 face-only regression plan remains in `Doc/Automatic-Mantle-Ledge-Test-Plan.md`.
+See `Doc/Deferred-Editor-Regeneration-Test-Plan.md` for the 0.37 performance pass, `Doc/Context-Aware-Details-Test-Plan.md` for the 0.36 Details-polish pass, `Doc/Authoring-Consistency-Test-Plan.md` for the 0.35 authoring-consistency pass, `Doc/Recheck-Diagnostics-Test-Plan.md` for the 0.34 recheck pass, `Doc/Diagnostic-Failure-Focus-Test-Plan.md` for the 0.33 failure-focus pass, `Doc/Diagnostic-Blocker-Focus-Test-Plan.md` for the 0.32 blocker-focus pass, `Doc/Diagnostic-Blocker-Selection-Test-Plan.md` for the 0.31 blocker-selection pass, `Doc/Clearance-Blocker-Diagnostics-Test-Plan.md` for the 0.30 clearance-blocker pass, `Doc/Path-Blocker-Diagnostics-Test-Plan.md` for the 0.29 exact blocker pass, `Doc/Rejected-Traversal-Failure-Markers-Test-Plan.md` for the 0.28 failure-marker pass, `Doc/Rejected-Traversal-Labels-Test-Plan.md` for the 0.27 viewport-diagnostics pass, `Doc/Preview-Visual-Language-Test-Plan.md` for the 0.26 preview pass, `Doc/Traversal-Validation-Diagnostics-Test-Plan.md` for the 0.25 diagnostics pass, `Doc/Traversal-Departure-Validation-Test-Plan.md` for the 0.24 departure pass, `Doc/Traversal-Landing-Recovery-Test-Plan.md` for the 0.23 landing-recovery pass, `Doc/Traversal-Landing-Validation-Test-Plan.md` for the 0.22 landing-support pass, `Doc/Mantle-Traversal-Test-Plan.md` for runtime traversal coverage, `Doc/Mantle-Validation-Test-Plan.md` for generation-time path validation, and `Doc/Automatic-Mantle-Ledge-Geometry-Test-Plan.md` for the Automatic ledge-geometry pass. The 0.20 face-only regression plan remains in `Doc/Automatic-Mantle-Ledge-Test-Plan.md`.
 
 ### Custom Traversal Context
 
@@ -408,3 +416,14 @@ See `Doc/Mantle-Traversal-Test-Plan.md`, `Doc/Jump-Traversal-Test-Plan.md`, `Doc
 Omni deliberately uses ordinary native point links for its production foundation. Unreal Engine 5.8 contains segment-link code, but Epic's own engine source describes segment links as unsupported and not completed to production quality.
 
 No engine source modifications are required.
+
+### Diagnostic Blocker Actions
+
+Point, Volume, and Spline Omni actors expose two blocker actions under **Omni | Actions**:
+
+- **Select Diagnostic Blockers** gathers the unique actors currently identified by rejected Jump and Mantle diagnostics and selects them in the Level Editor without moving the camera.
+- **Focus Diagnostic Blockers** selects the same blocker set and frames the complete set in the active Level Editor viewport. Other viewports are left unchanged.
+
+These actions are especially useful with Volume and Spline generation where several rejected crossings can point at different pieces of level geometry. Both use diagnostics already produced during generation and do not perform additional collision queries or change link validity.
+
+If the current rejected diagnostics do not identify a blocking actor, such as missing support or speed-only failures, there is nothing to select or focus and the current viewport is left alone.

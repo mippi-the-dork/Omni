@@ -182,8 +182,7 @@ namespace OmniPreview
         DrawDebugString(World, LabelLocation, FString(DirectionPrefix) + Reason, nullptr, RejectedColor(), 0.0f, false, 1.0f);
     }
 
-    void DrawRejectedFailureMarker(
-        UWorld* World,
+    FVector GetRejectedFailureLocation(
         const FVector& SourceWorld,
         const FVector& TargetWorld,
         ENavLinkDirection::Type Direction,
@@ -191,13 +190,9 @@ namespace OmniPreview
         bool bSpeedFailure,
         bool bMantleTraversal,
         float ArcHeight,
-        const FVector& Offset)
+        bool bHasExactFailureLocation,
+        const FVector& ExactFailureLocation)
     {
-        if (!World)
-        {
-            return;
-        }
-
         const bool bReverse = Direction == ENavLinkDirection::RightToLeft;
         const FVector Start = bReverse ? TargetWorld : SourceWorld;
         const FVector End = bReverse ? SourceWorld : TargetWorld;
@@ -208,17 +203,27 @@ namespace OmniPreview
             switch (FailureCode)
             {
             case 1: // Departure support
-            case 2: // Departure clearance
                 MarkerLocation = Start;
                 break;
 
+            case 2: // Departure clearance
+                MarkerLocation = bHasExactFailureLocation ? ExactFailureLocation : Start;
+                break;
+
             case 4: // Landing support
-            case 5: // Landing clearance
                 MarkerLocation = End;
                 break;
 
+            case 5: // Landing clearance
+                MarkerLocation = bHasExactFailureLocation ? ExactFailureLocation : End;
+                break;
+
             case 3: // Travel path
-                if (bMantleTraversal)
+                if (bHasExactFailureLocation)
+                {
+                    MarkerLocation = ExactFailureLocation;
+                }
+                else if (bMantleTraversal)
                 {
                     MarkerLocation = OmniTraversal::CalculateMantlePathPoint(Start, End, 0.5f, ArcHeight);
                 }
@@ -241,7 +246,38 @@ namespace OmniPreview
             }
         }
 
-        MarkerLocation += Offset;
+        return MarkerLocation;
+    }
+
+    void DrawRejectedFailureMarker(
+        UWorld* World,
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        uint8 FailureCode,
+        bool bSpeedFailure,
+        bool bMantleTraversal,
+        float ArcHeight,
+        const FVector& Offset,
+        bool bHasExactFailureLocation,
+        const FVector& ExactFailureLocation)
+    {
+        if (!World)
+        {
+            return;
+        }
+
+        const FVector MarkerLocation = GetRejectedFailureLocation(
+            SourceWorld,
+            TargetWorld,
+            Direction,
+            FailureCode,
+            bSpeedFailure,
+            bMantleTraversal,
+            ArcHeight,
+            bHasExactFailureLocation,
+            ExactFailureLocation) + Offset;
+
         const FColor Color = RejectedColor();
         DrawDebugSphere(World, MarkerLocation, 8.0f, 8, Color, false, -1.0f, 0, 1.5f);
         DrawDebugPoint(World, MarkerLocation, 10.0f, Color, false, -1.0f, 0);

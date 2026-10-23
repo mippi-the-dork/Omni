@@ -1,4 +1,7 @@
 #include "OmniSplineNavLink.h"
+#include "HAL/PlatformTime.h"
+
+#include "OmniEditorDiagnostics.h"
 
 #include "OmniJumpTraversalComponent.h"
 #include "OmniMantleTraversalComponent.h"
@@ -81,7 +84,16 @@ void AOmniSplineNavLink::OnConstruction(const FTransform& Transform)
     ApplyEditorVisualStyle();
     if (bAutoRegenerate)
     {
-        RegenerateLinks();
+#if WITH_EDITOR
+        if (GetWorld() && GetWorld()->WorldType == EWorldType::Editor)
+        {
+            QueueEditorRegeneration();
+        }
+        else
+#endif
+        {
+            RegenerateLinks();
+        }
     }
 }
 
@@ -103,6 +115,15 @@ void AOmniSplineNavLink::Tick(float DeltaSeconds)
     Super::Tick(DeltaSeconds);
 
 #if WITH_EDITOR
+    if (bEditorRegenerationPending)
+    {
+        bEditorRegenerationPending = false;
+        if (bAutoRegenerate)
+        {
+            RegenerateLinks();
+        }
+    }
+
     DrawEditorPreview();
 #endif
 }
@@ -114,6 +135,83 @@ bool AOmniSplineNavLink::ShouldTickIfViewportsOnly() const
 }
 #endif
 
+void AOmniSplineNavLink::SelectDiagnosticBlockers()
+{
+    TArray<FString> BlockingObjects;
+    auto Collect = [&BlockingObjects](const TArray<FProjectedPair>& Pairs)
+    {
+        for (const FProjectedPair& Pair : Pairs)
+        {
+            if (!Pair.BlockingObject.IsEmpty())
+            {
+                BlockingObjects.AddUnique(Pair.BlockingObject);
+            }
+        }
+    };
+
+    Collect(PreviewRejectedJumpPairs);
+    Collect(PreviewRejectedMantlePairs);
+
+    OmniEditorDiagnostics::SelectBlockingActors(GetWorld(), BlockingObjects);
+}
+
+void AOmniSplineNavLink::FocusDiagnosticBlockers()
+{
+    TArray<FString> BlockingObjects;
+    auto Collect = [&BlockingObjects](const TArray<FProjectedPair>& Pairs)
+    {
+        for (const FProjectedPair& Pair : Pairs)
+        {
+            if (!Pair.BlockingObject.IsEmpty())
+            {
+                BlockingObjects.AddUnique(Pair.BlockingObject);
+            }
+        }
+    };
+
+    Collect(PreviewRejectedJumpPairs);
+    Collect(PreviewRejectedMantlePairs);
+
+    OmniEditorDiagnostics::FocusBlockingActors(GetWorld(), BlockingObjects);
+}
+
+void AOmniSplineNavLink::FocusDiagnosticFailures()
+{
+    TArray<FVector> FailureLocations;
+
+    auto Collect = [&FailureLocations](const TArray<FProjectedPair>& Links, bool bMantleTraversal, float ArcHeight)
+    {
+        for (const FProjectedPair& Link : Links)
+        {
+            FailureLocations.Add(OmniPreview::GetRejectedFailureLocation(
+                Link.SourceWorld,
+                Link.TargetWorld,
+                Link.NativeDirection,
+                Link.ValidationFailureCode,
+                Link.bValidationSpeedFailure,
+                bMantleTraversal,
+                ArcHeight,
+                Link.bHasBlockingLocation,
+                Link.BlockingLocation));
+        }
+    };
+
+    Collect(PreviewRejectedJumpPairs, false, JumpApexHeight);
+    Collect(PreviewRejectedMantlePairs, true, MantleArcHeight);
+
+    OmniEditorDiagnostics::FocusFailureLocations(FailureLocations);
+}
+
+void AOmniSplineNavLink::RecheckDiagnostics()
+{
+    RegenerateLinks();
+
+    if (!PreviewRejectedJumpPairs.IsEmpty() || !PreviewRejectedMantlePairs.IsEmpty())
+    {
+        FocusDiagnosticFailures();
+    }
+}
+
 void AOmniSplineNavLink::RegenerateLinks()
 {
     if (bIsRegenerating || !GeneratedLinks || !SourceSpline || !TargetSpline)
@@ -121,7 +219,12 @@ void AOmniSplineNavLink::RegenerateLinks()
         return;
     }
 
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+
     TGuardValue<bool> RegenerationGuard(bIsRegenerating, true);
+    const double GenerationStartSeconds = FPlatformTime::Seconds();
     ResetDebugCounters();
 
     TArray<FNavigationLink> NewLinks;
@@ -247,6 +350,8 @@ void AOmniSplineNavLink::RegenerateLinks()
         }
     }
 
+    LastGenerationTimeMs = static_cast<float>((FPlatformTime::Seconds() - GenerationStartSeconds) * 1000.0);
+
     if (AreLinkArraysEquivalent(GeneratedLinks->Links, NewLinks))
     {
         return;
@@ -256,6 +361,58 @@ void AOmniSplineNavLink::RegenerateLinks()
     GeneratedLinks->UpdateBounds();
     GeneratedLinks->MarkRenderStateDirty();
     NotifyNavigationSystem();
+}
+
+void AOmniSplineNavLink::SwapSourceAndTarget()
+{
+    if (!SourceSpline || !TargetSpline)
+    {
+        return;
+    }
+
+    SourceSpline->Modify();
+    TargetSpline->Modify();
+
+    struct FSplineSnapshot
+    {
+        FTransform RelativeTransform;
+        TArray<FSplinePoint> Points;
+        bool bClosedLoop = false;
+    };
+
+    const auto CaptureSpline = [](const USplineComponent& Spline)
+    {
+        FSplineSnapshot Snapshot;
+        Snapshot.RelativeTransform = Spline.GetRelativeTransform();
+        Snapshot.bClosedLoop = Spline.IsClosedLoop();
+
+        const int32 PointCount = Spline.GetNumberOfSplinePoints();
+        Snapshot.Points.Reserve(PointCount);
+        for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
+        {
+            Snapshot.Points.Add(Spline.GetSplinePointAt(PointIndex, ESplineCoordinateSpace::Local));
+        }
+
+        return Snapshot;
+    };
+
+    const auto ApplySpline = [](USplineComponent& Spline, const FSplineSnapshot& Snapshot)
+    {
+        Spline.SetRelativeTransform(Snapshot.RelativeTransform);
+        Spline.ClearSplinePoints(false);
+        Spline.AddPoints(Snapshot.Points, false);
+        Spline.SetClosedLoop(Snapshot.bClosedLoop, false);
+        Spline.UpdateSpline();
+    };
+
+    const FSplineSnapshot SourceSnapshot = CaptureSpline(*SourceSpline);
+    const FSplineSnapshot TargetSnapshot = CaptureSpline(*TargetSpline);
+
+    ApplySpline(*SourceSpline, TargetSnapshot);
+    ApplySpline(*TargetSpline, SourceSnapshot);
+
+    ApplyEditorVisualStyle();
+    RegenerateLinks();
 }
 
 void AOmniSplineNavLink::ResetSplines()
@@ -742,16 +899,49 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return false;
     }
 
-    const double MergeDistanceSq = FMath::Square(static_cast<double>(FMath::Max(0.0f, EndpointMergeDistance)));
+    const double MergeDistance = static_cast<double>(FMath::Max(0.0f, EndpointMergeDistance));
+    const double MergeDistanceSq = FMath::Square(MergeDistance);
+    const double MergeCellSize = FMath::Max(1.0, MergeDistance);
+    const auto ToMergeCell = [MergeCellSize](const FVector& Location)
+    {
+        return FIntVector(
+            FMath::FloorToInt(Location.X / MergeCellSize),
+            FMath::FloorToInt(Location.Y / MergeCellSize),
+            FMath::FloorToInt(Location.Z / MergeCellSize));
+    };
+
     if (MergeDistanceSq > 0.0)
     {
-        for (const FProjectedPair& ExistingPair : PreviewGeneratedPairs)
+        const FIntVector SourceCell = ToMergeCell(Pair.SourceWorld);
+        for (int32 Z = -1; Z <= 1; ++Z)
         {
-            if (FVector::DistSquared(ExistingPair.SourceWorld, Pair.SourceWorld) <= MergeDistanceSq
-                && FVector::DistSquared(ExistingPair.TargetWorld, Pair.TargetWorld) <= MergeDistanceSq)
+            for (int32 Y = -1; Y <= 1; ++Y)
             {
-                ++MergedDuplicateCount;
-                return false;
+                for (int32 X = -1; X <= 1; ++X)
+                {
+                    const FIntVector NeighborCell = SourceCell + FIntVector(X, Y, Z);
+                    const TArray<int32>* PairIndices = PreviewPairMergeBuckets.Find(NeighborCell);
+                    if (!PairIndices)
+                    {
+                        continue;
+                    }
+
+                    for (const int32 ExistingIndex : *PairIndices)
+                    {
+                        if (!PreviewGeneratedPairs.IsValidIndex(ExistingIndex))
+                        {
+                            continue;
+                        }
+
+                        const FProjectedPair& ExistingPair = PreviewGeneratedPairs[ExistingIndex];
+                        if (FVector::DistSquared(ExistingPair.SourceWorld, Pair.SourceWorld) <= MergeDistanceSq
+                            && FVector::DistSquared(ExistingPair.TargetWorld, Pair.TargetWorld) <= MergeDistanceSq)
+                        {
+                            ++MergedDuplicateCount;
+                            return false;
+                        }
+                    }
+                }
             }
         }
     }
@@ -825,10 +1015,14 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         PreviewPair.bUsesMantleTraversal = bUseMantle;
         PreviewPair.bUsesCustomTraversal = bUseCustom;
         PreviewGeneratedPairs.Add(PreviewPair);
+        if (MergeDistanceSq > 0.0)
+        {
+            PreviewPairMergeBuckets.FindOrAdd(ToMergeCell(PreviewPair.SourceWorld)).Add(PreviewGeneratedPairs.Num() - 1);
+        }
         return true;
     };
 
-    auto RecordRejectedJump = [&](ENavLinkDirection::Type Direction, int32 FailureCode, bool bTooFast)
+    auto RecordRejectedJump = [&](ENavLinkDirection::Type Direction, int32 FailureCode, bool bTooFast, const FVector& BlockingLocation, const FString& BlockingObject)
     {
         if (bTooFast)
         {
@@ -854,6 +1048,9 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         PreviewPair.bUsesCustomTraversal = false;
         PreviewPair.ValidationFailureCode = static_cast<uint8>(FailureCode);
         PreviewPair.bValidationSpeedFailure = bTooFast;
+        PreviewPair.bHasBlockingLocation = (FailureCode == 2 || FailureCode == 3 || FailureCode == 5) && (!BlockingLocation.IsNearlyZero() || !BlockingObject.IsEmpty());
+        PreviewPair.BlockingLocation = BlockingLocation;
+        PreviewPair.BlockingObject = BlockingObject;
         PreviewRejectedJumpPairs.Add(PreviewPair);
     };
 
@@ -863,16 +1060,18 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
         int32 FailureCode = 0;
         bool bTooFast = false;
-        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast))
+        FVector BlockingLocation = FVector::ZeroVector;
+        FString BlockingObject;
+        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject))
         {
             return true;
         }
 
-        RecordRejectedJump(Direction, FailureCode, bTooFast);
+        RecordRejectedJump(Direction, FailureCode, bTooFast, BlockingLocation, BlockingObject);
         return false;
     };
 
-    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction, int32 FailureCode)
+    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction, int32 FailureCode, const FVector& BlockingLocation, const FString& BlockingObject)
     {
         switch (FailureCode)
         {
@@ -891,6 +1090,9 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         PreviewPair.bUsesCustomTraversal = false;
         PreviewPair.ValidationFailureCode = static_cast<uint8>(FailureCode);
         PreviewPair.bValidationSpeedFailure = false;
+        PreviewPair.bHasBlockingLocation = (FailureCode == 2 || FailureCode == 3 || FailureCode == 5) && (!BlockingLocation.IsNearlyZero() || !BlockingObject.IsEmpty());
+        PreviewPair.BlockingLocation = BlockingLocation;
+        PreviewPair.BlockingObject = BlockingObject;
         PreviewRejectedMantlePairs.Add(PreviewPair);
     };
 
@@ -899,12 +1101,14 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
         const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
         int32 FailureCode = 0;
-        if (IsMantleDirectionValid(StartWorld, EndWorld, FailureCode))
+        FVector BlockingLocation = FVector::ZeroVector;
+        FString BlockingObject;
+        if (IsMantleDirectionValid(StartWorld, EndWorld, FailureCode, &BlockingLocation, &BlockingObject))
         {
             return true;
         }
 
-        RecordRejectedMantle(Direction, FailureCode);
+        RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
         return false;
     };
 
@@ -1032,8 +1236,10 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
                 const FVector MantleStartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
                 const FVector MantleEndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
                 int32 FailureCode = 0;
-                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode);
-                RecordRejectedMantle(Direction, FailureCode);
+                FVector BlockingLocation = FVector::ZeroVector;
+                FString BlockingObject;
+                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode, &BlockingLocation, &BlockingObject);
+                RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
             }
 
             if (Diagnostic.bMantleLedgeFallback)
@@ -1351,7 +1557,7 @@ bool AOmniSplineNavLink::IsPointInsidePolygon2D(const FVector2D& Point, const TA
     return bInside;
 }
 
-bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast) const
+bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject) const
 {
     OutFailureCode = 0;
     bOutTooFast = false;
@@ -1364,7 +1570,7 @@ bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const F
     Settings.MaxHorizontalSpeed = MaximumJumpHorizontalSpeed;
     Settings.ArcSegments = JumpValidationSegments;
 
-    const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings);
+    const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniJumpValidationResult::Valid)
     {
         return true;
@@ -1384,7 +1590,7 @@ bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const F
     return false;
 }
 
-bool AOmniSplineNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode) const
+bool AOmniSplineNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, FVector* OutBlockingLocation, FString* OutBlockingObject) const
 {
     OutFailureCode = 0;
 
@@ -1395,7 +1601,7 @@ bool AOmniSplineNavLink::IsMantleDirectionValid(const FVector& StartWorld, const
     Settings.AgentHalfHeight = JumpValidationAgentHalfHeight;
     Settings.PathSegments = MantleValidationSegments;
 
-    const EOmniMantleValidationResult Result = OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings);
+    const EOmniMantleValidationResult Result = OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniMantleValidationResult::Valid)
     {
         return true;
@@ -1793,6 +1999,7 @@ void AOmniSplineNavLink::ResetDebugCounters()
     PreviewSourceSamples.Reset();
     PreviewTargetSamples.Reset();
     PreviewGeneratedPairs.Reset();
+    PreviewPairMergeBuckets.Reset();
     PreviewRejectedJumpPairs.Reset();
     PreviewRejectedMantlePairs.Reset();
 }
@@ -1826,6 +2033,16 @@ void AOmniSplineNavLink::DrawEditorPreview() const
         case 5: return TEXT("Landing Clearance");
         default: return TEXT("Invalid");
         }
+    };
+
+    auto GetValidationLabel = [&](uint8 FailureCode, bool bSpeedFailure, const FString& BlockingObject) -> FString
+    {
+        FString Reason = GetValidationReason(FailureCode, bSpeedFailure);
+        if ((FailureCode == 2 || FailureCode == 3 || FailureCode == 5) && !BlockingObject.IsEmpty())
+        {
+            Reason += FString::Printf(TEXT(" [%s]"), *BlockingObject);
+        }
+        return Reason;
     };
 
     if (bDrawSamples)
@@ -1892,7 +2109,7 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 Pair.SourceWorld,
                 Pair.TargetWorld,
                 Pair.NativeDirection,
-                GetValidationReason(Pair.ValidationFailureCode, Pair.bValidationSpeedFailure),
+                GetValidationLabel(Pair.ValidationFailureCode, Pair.bValidationSpeedFailure, Pair.BlockingObject),
                 PreviewOffset);
             OmniPreview::DrawRejectedFailureMarker(
                 World,
@@ -1903,7 +2120,9 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 Pair.bValidationSpeedFailure,
                 false,
                 JumpApexHeight,
-                PreviewOffset);
+                PreviewOffset,
+                Pair.bHasBlockingLocation,
+                Pair.BlockingLocation);
         }
 
         for (const FProjectedPair& Pair : PreviewRejectedMantlePairs)
@@ -1923,7 +2142,7 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 Pair.SourceWorld,
                 Pair.TargetWorld,
                 Pair.NativeDirection,
-                GetValidationReason(Pair.ValidationFailureCode, false),
+                GetValidationLabel(Pair.ValidationFailureCode, false, Pair.BlockingObject),
                 PreviewOffset);
             OmniPreview::DrawRejectedFailureMarker(
                 World,
@@ -1934,7 +2153,9 @@ void AOmniSplineNavLink::DrawEditorPreview() const
                 false,
                 true,
                 MantleArcHeight,
-                PreviewOffset);
+                PreviewOffset,
+                Pair.bHasBlockingLocation,
+                Pair.BlockingLocation);
         }
     }
 }
@@ -1987,6 +2208,11 @@ void AOmniSplineNavLink::HandleNavigationGenerationFinished(ANavigationData* Nav
 }
 
 #if WITH_EDITOR
+void AOmniSplineNavLink::QueueEditorRegeneration()
+{
+    bEditorRegenerationPending = true;
+}
+
 void AOmniSplineNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
@@ -2016,7 +2242,7 @@ void AOmniSplineNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
     {
         if (bAutoRegenerate)
         {
-            RegenerateLinks();
+            QueueEditorRegeneration();
         }
         else
         {
@@ -2031,7 +2257,7 @@ void AOmniSplineNavLink::PostEditMove(bool bFinished)
 
     if (bFinished && bAutoRegenerate)
     {
-        RegenerateLinks();
+        QueueEditorRegeneration();
     }
 }
 

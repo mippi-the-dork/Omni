@@ -22,5 +22,10 @@ public class Omni : ModuleRules
                 "AIModule"
             }
         );
+
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.Add("UnrealEd");
+        }
     }
 }

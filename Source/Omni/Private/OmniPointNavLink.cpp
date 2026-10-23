@@ -1,4 +1,7 @@
 #include "OmniPointNavLink.h"
+#include "HAL/PlatformTime.h"
+
+#include "OmniEditorDiagnostics.h"
 
 #include "OmniJumpTraversalComponent.h"
 #include "OmniMantleTraversalComponent.h"
@@ -81,7 +84,16 @@ void AOmniPointNavLink::OnConstruction(const FTransform& Transform)
     ApplyEditorVisualStyle();
     if (bAutoRegenerate)
     {
-        RegenerateLink();
+#if WITH_EDITOR
+        if (GetWorld() && GetWorld()->WorldType == EWorldType::Editor)
+        {
+            QueueEditorRegeneration();
+        }
+        else
+#endif
+        {
+            RegenerateLink();
+        }
     }
 }
 
@@ -102,6 +114,15 @@ void AOmniPointNavLink::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
 #if WITH_EDITOR
+    if (bEditorRegenerationPending)
+    {
+        bEditorRegenerationPending = false;
+        if (bAutoRegenerate)
+        {
+            RegenerateLink();
+        }
+    }
+
     DrawEditorPreview();
 #endif
 }
@@ -113,6 +134,83 @@ bool AOmniPointNavLink::ShouldTickIfViewportsOnly() const
 }
 #endif
 
+void AOmniPointNavLink::SelectDiagnosticBlockers()
+{
+    TArray<FString> BlockingObjects;
+    auto Collect = [&BlockingObjects](const TArray<FPreviewLink>& Links)
+    {
+        for (const FPreviewLink& Link : Links)
+        {
+            if (!Link.BlockingObject.IsEmpty())
+            {
+                BlockingObjects.AddUnique(Link.BlockingObject);
+            }
+        }
+    };
+
+    Collect(PreviewRejectedJumpLinks);
+    Collect(PreviewRejectedMantleLinks);
+
+    OmniEditorDiagnostics::SelectBlockingActors(GetWorld(), BlockingObjects);
+}
+
+void AOmniPointNavLink::FocusDiagnosticBlockers()
+{
+    TArray<FString> BlockingObjects;
+    auto Collect = [&BlockingObjects](const TArray<FPreviewLink>& Links)
+    {
+        for (const FPreviewLink& Link : Links)
+        {
+            if (!Link.BlockingObject.IsEmpty())
+            {
+                BlockingObjects.AddUnique(Link.BlockingObject);
+            }
+        }
+    };
+
+    Collect(PreviewRejectedJumpLinks);
+    Collect(PreviewRejectedMantleLinks);
+
+    OmniEditorDiagnostics::FocusBlockingActors(GetWorld(), BlockingObjects);
+}
+
+void AOmniPointNavLink::FocusDiagnosticFailures()
+{
+    TArray<FVector> FailureLocations;
+
+    auto Collect = [&FailureLocations](const TArray<FPreviewLink>& Links, bool bMantleTraversal, float ArcHeight)
+    {
+        for (const FPreviewLink& Link : Links)
+        {
+            FailureLocations.Add(OmniPreview::GetRejectedFailureLocation(
+                Link.SourceWorld,
+                Link.TargetWorld,
+                Link.Direction,
+                Link.ValidationFailureCode,
+                Link.bValidationSpeedFailure,
+                bMantleTraversal,
+                ArcHeight,
+                Link.bHasBlockingLocation,
+                Link.BlockingLocation));
+        }
+    };
+
+    Collect(PreviewRejectedJumpLinks, false, JumpApexHeight);
+    Collect(PreviewRejectedMantleLinks, true, MantleArcHeight);
+
+    OmniEditorDiagnostics::FocusFailureLocations(FailureLocations);
+}
+
+void AOmniPointNavLink::RecheckDiagnostics()
+{
+    RegenerateLink();
+
+    if (!PreviewRejectedJumpLinks.IsEmpty() || !PreviewRejectedMantleLinks.IsEmpty())
+    {
+        FocusDiagnosticFailures();
+    }
+}
+
 void AOmniPointNavLink::RegenerateLink()
 {
     if (bIsRegenerating || !GeneratedLinks || !SourcePoint || !TargetPoint)
@@ -120,7 +218,12 @@ void AOmniPointNavLink::RegenerateLink()
         return;
     }
 
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+
     TGuardValue<bool> RegenerationGuard(bIsRegenerating, true);
+    const double GenerationStartSeconds = FPlatformTime::Seconds();
     ResetDebugState();
 
     TArray<FNavigationLink> NewNativeLinks;
@@ -195,6 +298,8 @@ void AOmniPointNavLink::RegenerateLink()
             CustomTraversal->ClearLinks();
         }
     }
+
+    LastGenerationTimeMs = static_cast<float>((FPlatformTime::Seconds() - GenerationStartSeconds) * 1000.0);
 
     if (AreLinkArraysEquivalent(GeneratedLinks->Links, NewNativeLinks))
     {
@@ -395,7 +500,7 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         return true;
     };
 
-    auto RecordRejectedJump = [&](ENavLinkDirection::Type Direction, int32 FailureCode, bool bTooFast)
+    auto RecordRejectedJump = [&](ENavLinkDirection::Type Direction, int32 FailureCode, bool bTooFast, const FVector& BlockingLocation, const FString& BlockingObject)
     {
         if (bTooFast)
         {
@@ -423,6 +528,9 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         Preview.bUsesCustomTraversal = false;
         Preview.ValidationFailureCode = static_cast<uint8>(FailureCode);
         Preview.bValidationSpeedFailure = bTooFast;
+        Preview.bHasBlockingLocation = (FailureCode == 2 || FailureCode == 3 || FailureCode == 5) && (!BlockingLocation.IsNearlyZero() || !BlockingObject.IsEmpty());
+        Preview.BlockingLocation = BlockingLocation;
+        Preview.BlockingObject = BlockingObject;
     };
 
     auto ValidateJumpDirection = [&](ENavLinkDirection::Type Direction) -> bool
@@ -431,16 +539,18 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? SourceWorld : TargetWorld;
         int32 FailureCode = 0;
         bool bTooFast = false;
-        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast))
+        FVector BlockingLocation = FVector::ZeroVector;
+        FString BlockingObject;
+        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject))
         {
             return true;
         }
 
-        RecordRejectedJump(Direction, FailureCode, bTooFast);
+        RecordRejectedJump(Direction, FailureCode, bTooFast, BlockingLocation, BlockingObject);
         return false;
     };
 
-    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction, int32 FailureCode)
+    auto RecordRejectedMantle = [&](ENavLinkDirection::Type Direction, int32 FailureCode, const FVector& BlockingLocation, const FString& BlockingObject)
     {
         switch (FailureCode)
         {
@@ -461,6 +571,9 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         Preview.bUsesCustomTraversal = false;
         Preview.ValidationFailureCode = static_cast<uint8>(FailureCode);
         Preview.bValidationSpeedFailure = false;
+        Preview.bHasBlockingLocation = (FailureCode == 2 || FailureCode == 3 || FailureCode == 5) && (!BlockingLocation.IsNearlyZero() || !BlockingObject.IsEmpty());
+        Preview.BlockingLocation = BlockingLocation;
+        Preview.BlockingObject = BlockingObject;
     };
 
     auto ValidateMantleDirection = [&](ENavLinkDirection::Type Direction) -> bool
@@ -468,12 +581,14 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? TargetWorld : SourceWorld;
         const FVector EndWorld = Direction == ENavLinkDirection::RightToLeft ? SourceWorld : TargetWorld;
         int32 FailureCode = 0;
-        if (IsMantleDirectionValid(StartWorld, EndWorld, FailureCode))
+        FVector BlockingLocation = FVector::ZeroVector;
+        FString BlockingObject;
+        if (IsMantleDirectionValid(StartWorld, EndWorld, FailureCode, &BlockingLocation, &BlockingObject))
         {
             return true;
         }
 
-        RecordRejectedMantle(Direction, FailureCode);
+        RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
         return false;
     };
 
@@ -601,8 +716,10 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
                 const FVector MantleStartWorld = Direction == ENavLinkDirection::RightToLeft ? TargetWorld : SourceWorld;
                 const FVector MantleEndWorld = Direction == ENavLinkDirection::RightToLeft ? SourceWorld : TargetWorld;
                 int32 FailureCode = 0;
-                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode);
-                RecordRejectedMantle(Direction, FailureCode);
+                FVector BlockingLocation = FVector::ZeroVector;
+                FString BlockingObject;
+                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode, &BlockingLocation, &BlockingObject);
+                RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
             }
 
             if (Diagnostic.bMantleLedgeFallback)
@@ -747,7 +864,7 @@ bool AOmniPointNavLink::ResolvePairDirection(const FVector& SourceWorld, const F
     }
 }
 
-bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast) const
+bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject) const
 {
     OutFailureCode = 0;
     bOutTooFast = false;
@@ -760,7 +877,7 @@ bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FV
     Settings.MaxHorizontalSpeed = MaximumJumpHorizontalSpeed;
     Settings.ArcSegments = JumpValidationSegments;
 
-    const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings);
+    const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniJumpValidationResult::Valid)
     {
         return true;
@@ -780,7 +897,7 @@ bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FV
     return false;
 }
 
-bool AOmniPointNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode) const
+bool AOmniPointNavLink::IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, FVector* OutBlockingLocation, FString* OutBlockingObject) const
 {
     OutFailureCode = 0;
 
@@ -791,7 +908,7 @@ bool AOmniPointNavLink::IsMantleDirectionValid(const FVector& StartWorld, const 
     Settings.AgentHalfHeight = TraversalAgentHalfHeight;
     Settings.PathSegments = MantleValidationSegments;
 
-    const EOmniMantleValidationResult Result = OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings);
+    const EOmniMantleValidationResult Result = OmniTraversal::ValidateMantlePath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniMantleValidationResult::Valid)
     {
         return true;
@@ -1180,6 +1297,16 @@ void AOmniPointNavLink::DrawEditorPreview() const
         }
     };
 
+    auto GetValidationLabel = [&](uint8 FailureCode, bool bSpeedFailure, const FString& BlockingObject) -> FString
+    {
+        FString Reason = GetValidationReason(FailureCode, bSpeedFailure);
+        if ((FailureCode == 2 || FailureCode == 3 || FailureCode == 5) && !BlockingObject.IsEmpty())
+        {
+            Reason += FString::Printf(TEXT(" [%s]"), *BlockingObject);
+        }
+        return Reason;
+    };
+
     if (bDrawSamples && bHasPreviewProjectedSource)
     {
         OmniPreview::DrawSamplePoint(World, PreviewProjectedSource, OmniPreview::SourceColor(), 14.0f, PreviewOffset);
@@ -1240,7 +1367,7 @@ void AOmniPointNavLink::DrawEditorPreview() const
                 Link.SourceWorld,
                 Link.TargetWorld,
                 Link.Direction,
-                GetValidationReason(Link.ValidationFailureCode, Link.bValidationSpeedFailure),
+                GetValidationLabel(Link.ValidationFailureCode, Link.bValidationSpeedFailure, Link.BlockingObject),
                 PreviewOffset);
             OmniPreview::DrawRejectedFailureMarker(
                 World,
@@ -1251,7 +1378,9 @@ void AOmniPointNavLink::DrawEditorPreview() const
                 Link.bValidationSpeedFailure,
                 false,
                 JumpApexHeight,
-                PreviewOffset);
+                PreviewOffset,
+                Link.bHasBlockingLocation,
+                Link.BlockingLocation);
         }
 
         for (const FPreviewLink& Link : PreviewRejectedMantleLinks)
@@ -1271,7 +1400,7 @@ void AOmniPointNavLink::DrawEditorPreview() const
                 Link.SourceWorld,
                 Link.TargetWorld,
                 Link.Direction,
-                GetValidationReason(Link.ValidationFailureCode, false),
+                GetValidationLabel(Link.ValidationFailureCode, false, Link.BlockingObject),
                 PreviewOffset);
             OmniPreview::DrawRejectedFailureMarker(
                 World,
@@ -1282,7 +1411,9 @@ void AOmniPointNavLink::DrawEditorPreview() const
                 false,
                 true,
                 MantleArcHeight,
-                PreviewOffset);
+                PreviewOffset,
+                Link.bHasBlockingLocation,
+                Link.BlockingLocation);
         }
     }
 }
@@ -1335,6 +1466,11 @@ void AOmniPointNavLink::HandleNavigationGenerationFinished(ANavigationData* NavD
 }
 
 #if WITH_EDITOR
+void AOmniPointNavLink::QueueEditorRegeneration()
+{
+    bEditorRegenerationPending = true;
+}
+
 void AOmniPointNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
@@ -1364,7 +1500,7 @@ void AOmniPointNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
     {
         if (bAutoRegenerate)
         {
-            RegenerateLink();
+            QueueEditorRegeneration();
         }
         else
         {
@@ -1378,7 +1514,7 @@ void AOmniPointNavLink::PostEditMove(bool bFinished)
     Super::PostEditMove(bFinished);
     if (bFinished && bAutoRegenerate)
     {
-        RegenerateLink();
+        QueueEditorRegeneration();
     }
 }
 

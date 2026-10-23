@@ -28,6 +28,18 @@ namespace OmniPreview
         const FString& Reason,
         const FVector& Offset);
 
+    /** Returns the world-space diagnostic marker location used for one rejected traversal. */
+    FVector GetRejectedFailureLocation(
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        ENavLinkDirection::Type Direction,
+        uint8 FailureCode,
+        bool bSpeedFailure,
+        bool bMantleTraversal,
+        float ArcHeight,
+        bool bHasExactFailureLocation = false,
+        const FVector& ExactFailureLocation = FVector::ZeroVector);
+
     /** Draws a compact marker at the diagnostic stage location for one rejected traversal. */
     void DrawRejectedFailureMarker(
         UWorld* World,
@@ -38,7 +50,9 @@ namespace OmniPreview
         bool bSpeedFailure,
         bool bMantleTraversal,
         float ArcHeight,
-        const FVector& Offset);
+        const FVector& Offset,
+        bool bHasExactFailureLocation = false,
+        const FVector& ExactFailureLocation = FVector::ZeroVector);
 
     /**
      * Draws one generated Omni traversal using the same directional convention for
