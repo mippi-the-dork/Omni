@@ -38,6 +38,27 @@ void UOmniMantleTraversalComponent::RebuildLinks(
     float InLandingTolerance,
     float InTraversalTimeout)
 {
+    AActor* Owner = GetOwner();
+    if (!Owner)
+    {
+        ClearLinks();
+        return;
+    }
+
+    // Cached specs are only reusable while the transient smart-link components
+    // that implement them still belong to this actor. Editor reconstruction,
+    // Undo/Redo, or component teardown can invalidate those objects without
+    // changing the authored link specs. Rebuild from a clean state when that
+    // happens instead of letting an equal-config fast path preserve stale links.
+    for (const UNavLinkCustomComponent* Link : MantleLinks)
+    {
+        if (!IsValid(Link) || Link->GetOwner() != Owner)
+        {
+            ClearLinks();
+            break;
+        }
+    }
+
     if (IsConfigurationEquivalent(LinkSpecs, InSupportedAgents, AreaClass, InDuration, InArcHeight, InLandingTolerance, InTraversalTimeout))
     {
         return;
@@ -47,13 +68,6 @@ void UOmniMantleTraversalComponent::RebuildLinks(
     ArcHeight = FMath::Max(0.0f, InArcHeight);
     LandingTolerance = FMath::Max(1.0f, InLandingTolerance);
     TraversalTimeout = FMath::Max(Duration + 0.1f, InTraversalTimeout);
-
-    AActor* Owner = GetOwner();
-    if (!Owner)
-    {
-        ClearLinks();
-        return;
-    }
 
     while (MantleLinks.Num() > LinkSpecs.Num())
     {
@@ -146,7 +160,7 @@ void UOmniMantleTraversalComponent::ClearLinks()
     {
         for (UNavLinkCustomComponent* Link : MantleLinks)
         {
-            if (Link)
+            if (IsValid(Link) && Link->GetOwner() == Owner)
             {
                 Owner->RemoveInstanceComponent(Link);
                 Link->DestroyComponent();
@@ -324,17 +338,19 @@ bool UOmniMantleTraversalComponent::IsConfigurationEquivalent(
         return false;
     }
 
-    if (const AActor* Owner = GetOwner())
+    const AActor* Owner = GetOwner();
+    if (!Owner)
     {
-        if (Owner->GetWorld())
+        return false;
+    }
+
+    for (const UNavLinkCustomComponent* Link : MantleLinks)
+    {
+        if (!IsValid(Link)
+            || Link->GetOwner() != Owner
+            || (Owner->GetWorld() && !Link->IsRegistered()))
         {
-            for (const UNavLinkCustomComponent* Link : MantleLinks)
-            {
-                if (!Link || !Link->IsRegistered())
-                {
-                    return false;
-                }
-            }
+            return false;
         }
     }
 

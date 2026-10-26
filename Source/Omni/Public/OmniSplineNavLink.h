@@ -10,6 +10,7 @@
 class ANavigationData;
 class UNavAreaBase;
 class UNavLinkComponent;
+class UNavigationSystemV1;
 class UOmniJumpTraversalComponent;
 class UOmniMantleTraversalComponent;
 class UOmniCustomTraversalComponent;
@@ -45,6 +46,8 @@ public:
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void PostRegisterAllComponents() override;
     virtual void PostUnregisterAllComponents() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void Destroyed() override;
     virtual void Tick(float DeltaSeconds) override;
 
 #if WITH_EDITOR
@@ -467,23 +470,32 @@ private:
         FString BlockingObject;
     };
 
-    bool BuildProjectedSamples(const USplineComponent& Spline, bool bSourceSpline, TArray<FProjectedSplineSample>& OutSamples);
-    bool BuildPerimeterSamples(const USplineComponent& Spline, bool bSourceSpline, TArray<FProjectedSplineSample>& OutSamples);
-    bool BuildFilledAreaSamples(const USplineComponent& Spline, bool bSourceSpline, TArray<FProjectedSplineSample>& OutSamples);
-    bool ProjectCandidate(const FVector& CandidateWorld, FVector& OutProjectedWorld) const;
-    void BuildNearestPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
-    void BuildMatchedPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, bool bWrapNormalizedDistance, TArray<FProjectedPair>& OutPairs) const;
-    void BuildMatchedAreaPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
-    bool AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks);
+    struct FPairGenerationContext
+    {
+        int32 SafeMaximumLinks = 1;
+        double MaxLinkDistanceSq = -1.0;
+        double MergeDistanceSq = 0.0;
+        double MergeCellSize = 1.0;
+        FTransform LinkTransform = FTransform::Identity;
+        UClass* ResolvedAreaClass = nullptr;
+    };
+
+    bool BuildProjectedSamples(const USplineComponent& Spline, bool bSourceSpline, UNavigationSystemV1& NavSystem, TArray<FProjectedSplineSample>& OutSamples);
+    bool BuildPerimeterSamples(const USplineComponent& Spline, bool bSourceSpline, UNavigationSystemV1& NavSystem, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, TArray<FProjectedSplineSample>& OutSamples);
+    bool BuildFilledAreaSamples(const USplineComponent& Spline, bool bSourceSpline, UNavigationSystemV1& NavSystem, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, TArray<FProjectedSplineSample>& OutSamples);
+    bool ProjectCandidate(UNavigationSystemV1& NavSystem, const FVector& CandidateWorld, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, FVector& OutProjectedWorld) const;
+    void BuildNearestPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const;
+    void BuildMatchedPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, bool bWrapNormalizedDistance, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const;
+    void BuildMatchedAreaPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const;
+    bool AddProjectedPair(const FProjectedPair& Pair, const FPairGenerationContext& Context, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks);
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     int32 FindNearestUsableSampleIndex(const FVector& Point, bool bPointIsSource, const TArray<FProjectedSplineSample>& Samples) const;
     int32 FindNearestUnusedSampleByNormalizedDistance(const FProjectedSplineSample& DriverSample, bool bSourceDrives, const TArray<FProjectedSplineSample>& Samples, const TBitArray<>& UsedSamples, bool bWrap) const;
     int32 FindNearestUnusedSampleByNormalizedArea(const FProjectedSplineSample& DriverSample, bool bSourceDrives, const TArray<FProjectedSplineSample>& Samples, const TBitArray<>& UsedSamples) const;
-    static bool IsPointInsidePolygon2D(const FVector2D& Point, const TArray<FVector2D>& Polygon);
-    bool IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld) const;
+    bool IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld, double MaxLinkDistanceSq = -2.0) const;
     bool IsTraversalAllowedByHeight(const FVector& StartWorld, const FVector& EndWorld) const;
     bool ResolvePairDirection(const FVector& SourceWorld, const FVector& TargetWorld, ENavLinkDirection::Type& OutDirection, bool& bOutHeightRestricted) const;
-    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr) const;
+    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr, bool bSkipDepartureSupport = false, bool bSkipDepartureClearance = false) const;
     bool IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr) const;
     float GetEffectiveLinkSpacing() const;
     ENavLinkDirection::Type GetNativeDirection() const;
@@ -491,6 +503,7 @@ private:
     void UpdateGenerationStatus();
     void ApplyEditorVisualStyle();
     void ResetDebugCounters();
+    bool CanRegenerateNow() const;
     void NotifyNavigationSystem();
     void BindNavigationGenerationDelegate();
     void UnbindNavigationGenerationDelegate();

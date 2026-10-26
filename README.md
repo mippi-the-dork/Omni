@@ -4,17 +4,17 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.39.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.56.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build is a **dense-generation optimization pass**. Volume and Spline endpoint duplicate suppression now use a regeneration-local spatial bucket keyed from the accepted pair's Source endpoint. A new candidate only searches the 27 neighboring cells that can possibly contain an accepted Source endpoint within **Endpoint Merge Distance**, then runs the same exact Source and Target squared-distance tests used previously. Pairing order, merge tolerance, traversal classification, validation, diagnostics, and generated-link limits are unchanged.
+This development build continues the **1.0 robustness and integration hardening phase**. Version 0.56 hardens the generated smart-link cache used by Jump, Mantle, and Custom traversal. Cached link specs are now considered reusable only when the transient `UNavLinkCustomComponent` instances are also valid, still owned by the correct Omni actor, and registered when that actor is in a world.
 
-The optimization is most relevant to dense Volume and Filled Area Spline setups, where the previous implementation could scan every already-accepted preview pair for every new candidate. **Last Generation Time**, added in 0.38, remains available under Omni Status so the same actor can be measured before and after the optimization.
+This matters during editor reconstruction, Undo/Redo, component unregister/register cycles, PIE transitions, and other lifecycle events where authored traversal specs can remain unchanged while transient generated components are recreated or temporarily unregistered. If Omni detects an invalid or foreign cached smart-link component, it safely discards the stale cache and rebuilds the generated links from the existing authored settings. Unregistered but otherwise healthy links are re-registered through the normal rebuild path rather than being incorrectly skipped by the equal-configuration fast path.
 
-Automatic editor regeneration also retains the 0.37 deferred/coalesced behavior: construction, property, and completed-move notifications queue one refresh for the next editor tick, while explicit **Regenerate Link(s)**, **Recheck Diagnostics**, navigation-build regeneration, component registration, Undo/Redo, and authoring actions remain immediate.
+The 0.55 lifecycle guards remain intact: deferred editor regeneration is cancelled during teardown, navigation-build callbacks refuse to regenerate invalid actors, and Jump/Mantle/Custom traversal is released from `EndPlay()` and `Destroyed()`. Normal authoring, traversal classification, generated endpoints, diagnostics, and serialized settings are unchanged.
 
-**Recheck Diagnostics** remains available on all three actor types to close the diagnose → fix → regenerate → verify loop.
+The dense-generation optimization work from 0.39 through 0.54 also remains intact. **Last Generation Time** is still available under Omni Status, but current development is focused on release hardening rather than speculative micro-optimization.
 
-See `Doc/Spatial-Duplicate-Merge-Optimization-Test-Plan.md` for the 0.39 performance regression plan, `Doc/Generation-Performance-Readout-Test-Plan.md` for the 0.38 timing pass, and `Doc/Deferred-Editor-Regeneration-Test-Plan.md` for the 0.37 coalescing pass.
+See `Doc/Smart-Link-Cache-Recovery-Test-Plan.md` for the 0.56 regression pass and `Doc/Lifecycle-Regeneration-Hardening-Test-Plan.md` for the 0.55 teardown/regeneration pass. The current 1.0 release bar is tracked in `Doc/1.0-Release-Requirements.md`.
 
 ### Built-in Mantle Traversal
 

@@ -44,6 +44,9 @@ struct FOmniJumpValidationSettings
     float AgentHalfHeight = 88.0f;
     float MaxHorizontalSpeed = 1600.0f;
     int32 ArcSegments = 16;
+    // Generation-local reuse: Automatic Mantle may already have proven these endpoint stages for the same directed pair.
+    bool bSkipDepartureSupport = false;
+    bool bSkipDepartureClearance = false;
 };
 
 enum class EOmniJumpValidationResult : uint8
@@ -101,6 +104,10 @@ struct FOmniAutomaticDirectionDiagnostic
     bool bUseMantle = false;
     bool bMantleValidationFallback = false;
     bool bMantleLedgeFallback = false;
+    bool bMantleValidationPerformed = false;
+    EOmniMantleValidationResult MantleValidationResult = EOmniMantleValidationResult::Invalid;
+    FVector MantleBlockingLocation = FVector::ZeroVector;
+    FString MantleBlockingObject;
     EOmniGroundTraversalResult GroundResult = EOmniGroundTraversalResult::Invalid;
 };
 
@@ -160,7 +167,11 @@ namespace OmniTraversal
         bool& bOutUseMantle,
         EOmniGroundTraversalResult* OutGroundResult = nullptr,
         bool* bOutMantleValidationFallback = nullptr,
-        bool* bOutMantleLedgeFallback = nullptr);
+        bool* bOutMantleLedgeFallback = nullptr,
+        bool* bOutMantleValidationPerformed = nullptr,
+        EOmniMantleValidationResult* OutMantleValidationResult = nullptr,
+        FVector* OutMantleBlockingLocation = nullptr,
+        FString* OutMantleBlockingObject = nullptr);
 
     /**
      * Returns true when an upward Automatic Mantle candidate has usable ledge

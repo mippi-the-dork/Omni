@@ -11,6 +11,7 @@ class ANavigationData;
 class UBoxComponent;
 class UNavAreaBase;
 class UNavLinkComponent;
+class UNavigationSystemV1;
 class UOmniJumpTraversalComponent;
 class UOmniMantleTraversalComponent;
 class UOmniCustomTraversalComponent;
@@ -49,6 +50,8 @@ public:
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void PostRegisterAllComponents() override;
     virtual void PostUnregisterAllComponents() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void Destroyed() override;
     virtual void Tick(float DeltaSeconds) override;
 
 #if WITH_EDITOR
@@ -511,20 +514,30 @@ private:
         FString BlockingObject;
     };
 
-    bool BuildProjectedGrid(const UBoxComponent& Box, bool bSourceVolume, TArray<FProjectedGridSample>& OutSamples);
-    bool ProjectCandidate(const FVector& CandidateWorld, const UBoxComponent& OwnerBox, FVector& OutProjectedWorld, bool& bOutOutsideVolume) const;
-    bool IsProjectedPointInsideBox(const FVector& WorldPoint, const UBoxComponent& Box) const;
-    void BuildNearestPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
-    void BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const;
-    bool AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks);
+    struct FPairGenerationContext
+    {
+        int32 SafeMaximumLinks = 1;
+        double MaxLinkDistanceSq = -1.0;
+        double MergeDistanceSq = 0.0;
+        double MergeCellSize = 1.0;
+        FTransform LinkTransform = FTransform::Identity;
+        UClass* ResolvedAreaClass = nullptr;
+    };
+
+    bool BuildProjectedGrid(const UBoxComponent& Box, bool bSourceVolume, UNavigationSystemV1& NavSystem, TArray<FProjectedGridSample>& OutSamples);
+    bool ProjectCandidate(UNavigationSystemV1& NavSystem, const FVector& CandidateWorld, const FTransform& OwnerBoxTransform, const FVector& OwnerBoxExtent, double ContainmentTolerance, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, FVector& OutProjectedWorld, bool& bOutOutsideVolume) const;
+    bool IsProjectedPointInsideBox(const FVector& WorldPoint, const FTransform& BoxTransform, const FVector& Extent, double Tolerance) const;
+    void BuildNearestPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const;
+    void BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const;
+    bool AddProjectedPair(const FProjectedPair& Pair, const FPairGenerationContext& Context, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks);
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     static int32 CalculateAxisSampleCount(double WorldLength, double Spacing);
     int32 FindNearestUsableSampleIndex(const FVector& Point, bool bPointIsSource, const TArray<FProjectedGridSample>& Samples) const;
     int32 FindNearestUnusedSampleByUV(const FProjectedGridSample& DriverSample, bool bSourceDrives, const TArray<FProjectedGridSample>& Samples, const TBitArray<>& UsedSamples) const;
-    bool IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld) const;
+    bool IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld, double MaxLinkDistanceSq = -2.0) const;
     bool IsTraversalAllowedByHeight(const FVector& StartWorld, const FVector& EndWorld) const;
     bool ResolvePairDirection(const FVector& SourceWorld, const FVector& TargetWorld, ENavLinkDirection::Type& OutDirection, bool& bOutHeightRestricted) const;
-    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr) const;
+    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr, bool bSkipDepartureSupport = false, bool bSkipDepartureClearance = false) const;
     bool IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr) const;
     float GetEffectiveLinkSpacing() const;
     ENavLinkDirection::Type GetNativeDirection() const;
@@ -532,6 +545,7 @@ private:
     void UpdateGenerationStatus();
     void ApplyEditorVisualStyle();
     void ResetDebugCounters();
+    bool CanRegenerateNow() const;
     void NotifyNavigationSystem();
     void BindNavigationGenerationDelegate();
     void UnbindNavigationGenerationDelegate();

@@ -337,7 +337,11 @@ namespace OmniTraversal
                     Resolved.bUseMantle,
                     &Resolved.GroundResult,
                     &Resolved.bMantleValidationFallback,
-                    &Resolved.bMantleLedgeFallback);
+                    &Resolved.bMantleLedgeFallback,
+                    AutomaticDiagnostic ? &AutomaticDiagnostic->bMantleValidationPerformed : nullptr,
+                    AutomaticDiagnostic ? &AutomaticDiagnostic->MantleValidationResult : nullptr,
+                    AutomaticDiagnostic ? &AutomaticDiagnostic->MantleBlockingLocation : nullptr,
+                    AutomaticDiagnostic ? &AutomaticDiagnostic->MantleBlockingObject : nullptr);
 
                 if (AutomaticDiagnostic)
                 {
@@ -704,7 +708,11 @@ namespace OmniTraversal
         bool& bOutUseMantle,
         EOmniGroundTraversalResult* OutGroundResult,
         bool* bOutMantleValidationFallback,
-        bool* bOutMantleLedgeFallback)
+        bool* bOutMantleLedgeFallback,
+        bool* bOutMantleValidationPerformed,
+        EOmniMantleValidationResult* OutMantleValidationResult,
+        FVector* OutMantleBlockingLocation,
+        FString* OutMantleBlockingObject)
     {
         bOutUseJump = false;
         bOutUseMantle = false;
@@ -715,6 +723,22 @@ namespace OmniTraversal
         if (bOutMantleLedgeFallback)
         {
             *bOutMantleLedgeFallback = false;
+        }
+        if (bOutMantleValidationPerformed)
+        {
+            *bOutMantleValidationPerformed = false;
+        }
+        if (OutMantleValidationResult)
+        {
+            *OutMantleValidationResult = EOmniMantleValidationResult::Invalid;
+        }
+        if (OutMantleBlockingLocation)
+        {
+            *OutMantleBlockingLocation = FVector::ZeroVector;
+        }
+        if (OutMantleBlockingObject)
+        {
+            OutMantleBlockingObject->Reset();
         }
 
         const float RiseThreshold = FMath::Max(0.0f, Settings.RiseThreshold);
@@ -740,7 +764,35 @@ namespace OmniTraversal
             MantleSettings.AgentHalfHeight = Settings.AgentHalfHeight;
             MantleSettings.PathSegments = Settings.MantleValidationSegments;
 
-            if (ValidateMantlePath(World, IgnoreActor, StartWorld, EndWorld, MantleSettings) == EOmniMantleValidationResult::Valid)
+            FVector MantleBlockingLocation = FVector::ZeroVector;
+            FString MantleBlockingObject;
+            const EOmniMantleValidationResult MantleValidationResult = ValidateMantlePath(
+                World,
+                IgnoreActor,
+                StartWorld,
+                EndWorld,
+                MantleSettings,
+                &MantleBlockingLocation,
+                &MantleBlockingObject);
+
+            if (bOutMantleValidationPerformed)
+            {
+                *bOutMantleValidationPerformed = true;
+            }
+            if (OutMantleValidationResult)
+            {
+                *OutMantleValidationResult = MantleValidationResult;
+            }
+            if (OutMantleBlockingLocation)
+            {
+                *OutMantleBlockingLocation = MantleBlockingLocation;
+            }
+            if (OutMantleBlockingObject)
+            {
+                *OutMantleBlockingObject = MantleBlockingObject;
+            }
+
+            if (MantleValidationResult == EOmniMantleValidationResult::Valid)
             {
                 bOutUseMantle = true;
                 return;
@@ -1058,12 +1110,14 @@ namespace OmniTraversal
         const FVector StartCenter = StartFeetWorld + CenterOffset;
         const FVector EndCenter = EndFeetWorld + CenterOffset;
 
-        if (!HasTraversalEndpointSupport(World, IgnoreActor, EndFeetWorld, StartFeetWorld, SafeRadius))
+        if (!Settings.bSkipDepartureSupport
+            && !HasTraversalEndpointSupport(World, IgnoreActor, EndFeetWorld, StartFeetWorld, SafeRadius))
         {
             return EOmniJumpValidationResult::DepartureSupport;
         }
 
-        if (!HasTraversalEndpointRecoveryClearance(
+        if (!Settings.bSkipDepartureClearance
+            && !HasTraversalEndpointRecoveryClearance(
                 World,
                 IgnoreActor,
                 EndFeetWorld,

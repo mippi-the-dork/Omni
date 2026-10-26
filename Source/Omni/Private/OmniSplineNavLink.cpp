@@ -26,6 +26,62 @@
 namespace OmniSplineNavLinkPrivate
 {
     constexpr float LinkComparisonTolerance = 0.1f;
+
+    struct FPolygonEdge2D
+    {
+        FVector2D A = FVector2D::ZeroVector;
+        FVector2D B = FVector2D::ZeroVector;
+    };
+
+    void BuildPolygonEdges(const TArray<FVector2D>& Polygon, TArray<FPolygonEdge2D>& OutEdges)
+    {
+        OutEdges.Reset();
+        if (Polygon.Num() < 3)
+        {
+            return;
+        }
+
+        OutEdges.Reserve(Polygon.Num());
+        int32 PreviousIndex = Polygon.Num() - 1;
+        for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+        {
+            FPolygonEdge2D& Edge = OutEdges.Emplace_GetRef();
+            Edge.A = Polygon[Index];
+            Edge.B = Polygon[PreviousIndex];
+            PreviousIndex = Index;
+        }
+    }
+
+    bool IsPointInsidePolygon2D(const FVector2D& Point, const TArray<FPolygonEdge2D>& Edges)
+    {
+        if (Edges.Num() < 3)
+        {
+            return false;
+        }
+
+        bool bInside = false;
+        for (const FPolygonEdge2D& Edge : Edges)
+        {
+            const FVector2D& A = Edge.A;
+            const FVector2D& B = Edge.B;
+
+            const bool bCrossesScanline = ((A.Y > Point.Y) != (B.Y > Point.Y));
+            if (bCrossesScanline)
+            {
+                const double Denominator = B.Y - A.Y;
+                if (!FMath::IsNearlyZero(Denominator))
+                {
+                    const double CrossingX = (B.X - A.X) * (Point.Y - A.Y) / Denominator + A.X;
+                    if (Point.X < CrossingX)
+                    {
+                        bInside = !bInside;
+                    }
+                }
+            }
+        }
+
+        return bInside;
+    }
 }
 
 AOmniSplineNavLink::AOmniSplineNavLink()
@@ -106,8 +162,63 @@ void AOmniSplineNavLink::PostRegisterAllComponents()
 
 void AOmniSplineNavLink::PostUnregisterAllComponents()
 {
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
     UnbindNavigationGenerationDelegate();
     Super::PostUnregisterAllComponents();
+}
+
+void AOmniSplineNavLink::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+    UnbindNavigationGenerationDelegate();
+
+    // EndPlay covers PIE stop, level transitions, streamed-level removal, and
+    // runtime destruction. Release paused path following before the generated
+    // smart-link components leave the world.
+    if (JumpTraversal)
+    {
+        JumpTraversal->ClearLinks();
+    }
+    if (MantleTraversal)
+    {
+        MantleTraversal->ClearLinks();
+    }
+    if (CustomTraversal)
+    {
+        CustomTraversal->ClearLinks();
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
+void AOmniSplineNavLink::Destroyed()
+{
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+    UnbindNavigationGenerationDelegate();
+
+    // Release any AI currently paused on an Omni smart link before the actor's
+    // components are torn down. This keeps deletion, PIE shutdown, and level
+    // teardown from leaving path following waiting on a link that no longer exists.
+    if (JumpTraversal)
+    {
+        JumpTraversal->ClearLinks();
+    }
+    if (MantleTraversal)
+    {
+        MantleTraversal->ClearLinks();
+    }
+    if (CustomTraversal)
+    {
+        CustomTraversal->ClearLinks();
+    }
+
+    Super::Destroyed();
 }
 
 void AOmniSplineNavLink::Tick(float DeltaSeconds)
@@ -118,7 +229,7 @@ void AOmniSplineNavLink::Tick(float DeltaSeconds)
     if (bEditorRegenerationPending)
     {
         bEditorRegenerationPending = false;
-        if (bAutoRegenerate)
+        if (bAutoRegenerate && CanRegenerateNow())
         {
             RegenerateLinks();
         }
@@ -214,7 +325,7 @@ void AOmniSplineNavLink::RecheckDiagnostics()
 
 void AOmniSplineNavLink::RegenerateLinks()
 {
-    if (bIsRegenerating || !GeneratedLinks || !SourceSpline || !TargetSpline)
+    if (bIsRegenerating || !CanRegenerateNow() || !GeneratedLinks || !SourceSpline || !TargetSpline)
     {
         return;
     }
@@ -235,15 +346,35 @@ void AOmniSplineNavLink::RegenerateLinks()
     if (bEnabled)
     {
         const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
-        NewLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
-        NewJumpLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
-        NewMantleLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
-        NewCustomLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
+        FPairGenerationContext PairContext;
+        PairContext.SafeMaximumLinks = SafeMaximumLinks;
+        PairContext.MaxLinkDistanceSq = MaximumLinkDistance > 0.0f
+            ? FMath::Square(static_cast<double>(MaximumLinkDistance))
+            : -1.0;
+        const double MergeDistance = static_cast<double>(FMath::Max(0.0f, EndpointMergeDistance));
+        PairContext.MergeDistanceSq = FMath::Square(MergeDistance);
+        PairContext.MergeCellSize = FMath::Max(1.0, MergeDistance);
+        PairContext.LinkTransform = GeneratedLinks->GetComponentTransform();
+        PairContext.ResolvedAreaClass = AreaClass.Get();
+        if (!PairContext.ResolvedAreaClass)
+        {
+            PairContext.ResolvedAreaClass = UNavArea_Default::StaticClass();
+        }
+
+        NewLinks.Reserve(SafeMaximumLinks);
+        NewJumpLinks.Reserve(SafeMaximumLinks);
+        NewMantleLinks.Reserve(SafeMaximumLinks);
+        NewCustomLinks.Reserve(SafeMaximumLinks);
+        PreviewGeneratedPairs.Reserve(SafeMaximumLinks);
+        PreviewPairMergeBuckets.Reserve(SafeMaximumLinks);
 
         TArray<FProjectedSplineSample> SourceSamples;
         TArray<FProjectedSplineSample> TargetSamples;
-        BuildProjectedSamples(*SourceSpline, true, SourceSamples);
-        BuildProjectedSamples(*TargetSpline, false, TargetSamples);
+        if (UNavigationSystemV1* NavSystem = UNavigationSystemV1::GetCurrent(GetWorld()))
+        {
+            BuildProjectedSamples(*SourceSpline, true, *NavSystem, SourceSamples);
+            BuildProjectedSamples(*TargetSpline, false, *NavSystem, TargetSamples);
+        }
 
         ValidSourceSampleCount = SourceSamples.Num();
         ValidTargetSampleCount = TargetSamples.Num();
@@ -260,48 +391,66 @@ void AOmniSplineNavLink::RegenerateLinks()
 
                 if (bSourceFilledArea && bTargetFilledArea)
                 {
-                    BuildMatchedAreaPairs(SourceSamples, TargetSamples, CandidatePairs);
+                    BuildMatchedAreaPairs(SourceSamples, TargetSamples, PairContext.MaxLinkDistanceSq, CandidatePairs);
                 }
                 else if (!bSourceFilledArea && !bTargetFilledArea)
                 {
                     const bool bWrap = SourceSpline->IsClosedLoop() && TargetSpline->IsClosedLoop();
-                    BuildMatchedPairs(SourceSamples, TargetSamples, bWrap, CandidatePairs);
+                    BuildMatchedPairs(SourceSamples, TargetSamples, bWrap, PairContext.MaxLinkDistanceSq, CandidatePairs);
                 }
                 else
                 {
                     bMatchedGridFallbackToNearest = true;
-                    BuildNearestPairs(SourceSamples, TargetSamples, CandidatePairs);
+                    BuildNearestPairs(SourceSamples, TargetSamples, PairContext.MaxLinkDistanceSq, CandidatePairs);
                 }
             }
             else
             {
-                BuildNearestPairs(SourceSamples, TargetSamples, CandidatePairs);
+                BuildNearestPairs(SourceSamples, TargetSamples, PairContext.MaxLinkDistanceSq, CandidatePairs);
             }
 
-            auto GeneratedCount = [&NewLinks, &NewJumpLinks, &NewMantleLinks, &NewCustomLinks]()
-            {
-                return NewLinks.Num() + NewJumpLinks.Num() + NewMantleLinks.Num() + NewCustomLinks.Num();
-            };
+            int32 GeneratedCount = 0;
 
-            TBitArray<> AttemptedPairs(false, CandidatePairs.Num());
             const int32 SpreadAttemptCount = FMath::Min(SafeMaximumLinks, CandidatePairs.Num());
-            for (int32 AttemptIndex = 0; AttemptIndex < SpreadAttemptCount && GeneratedCount() < SafeMaximumLinks; ++AttemptIndex)
+            TArray<int32> SpreadPairIndices;
+            SpreadPairIndices.Reserve(SpreadAttemptCount);
+            for (int32 AttemptIndex = 0; AttemptIndex < SpreadAttemptCount; ++AttemptIndex)
             {
                 const int32 PairIndex = SpreadAttemptCount <= 1
                     ? CandidatePairs.Num() / 2
                     : FMath::RoundToInt(
                         static_cast<double>(AttemptIndex) * static_cast<double>(CandidatePairs.Num() - 1)
                         / static_cast<double>(SpreadAttemptCount - 1));
-
-                AttemptedPairs[PairIndex] = true;
-                AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks);
+                SpreadPairIndices.Add(PairIndex);
             }
 
-            for (int32 PairIndex = 0; PairIndex < CandidatePairs.Num() && GeneratedCount() < SafeMaximumLinks; ++PairIndex)
+            for (const int32 PairIndex : SpreadPairIndices)
             {
-                if (!AttemptedPairs[PairIndex])
+                if (GeneratedCount >= SafeMaximumLinks)
                 {
-                    AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks);
+                    break;
+                }
+
+                if (AddProjectedPair(CandidatePairs[PairIndex], PairContext, NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks))
+                {
+                    ++GeneratedCount;
+                }
+            }
+
+            int32 SpreadIndexCursor = 0;
+            for (int32 PairIndex = 0; PairIndex < CandidatePairs.Num() && GeneratedCount < SafeMaximumLinks; ++PairIndex)
+            {
+                while (SpreadIndexCursor < SpreadPairIndices.Num() && SpreadPairIndices[SpreadIndexCursor] < PairIndex)
+                {
+                    ++SpreadIndexCursor;
+                }
+
+                const bool bWasSpreadAttempt = SpreadIndexCursor < SpreadPairIndices.Num()
+                    && SpreadPairIndices[SpreadIndexCursor] == PairIndex;
+                if (!bWasSpreadAttempt
+                    && AddProjectedPair(CandidatePairs[PairIndex], PairContext, NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks))
+                {
+                    ++GeneratedCount;
                 }
             }
         }
@@ -443,17 +592,25 @@ void AOmniSplineNavLink::ResetSplines()
     RegenerateLinks();
 }
 
-bool AOmniSplineNavLink::BuildProjectedSamples(const USplineComponent& Spline, bool bSourceSpline, TArray<FProjectedSplineSample>& OutSamples)
+bool AOmniSplineNavLink::BuildProjectedSamples(const USplineComponent& Spline, bool bSourceSpline, UNavigationSystemV1& NavSystem, TArray<FProjectedSplineSample>& OutSamples)
 {
+    const FVector SafeProjectionExtent(
+        FMath::Max(0.0, ProjectionExtent.X),
+        FMath::Max(0.0, ProjectionExtent.Y),
+        FMath::Max(0.0, ProjectionExtent.Z));
+    const double MaxProjectionDistanceSq = MaximumProjectionDistance > 0.0f
+        ? FMath::Square(static_cast<double>(MaximumProjectionDistance))
+        : -1.0;
+
     if (Spline.IsClosedLoop() && ClosedSplineCoverage == EOmniClosedSplineCoverage::FilledArea)
     {
-        return BuildFilledAreaSamples(Spline, bSourceSpline, OutSamples);
+        return BuildFilledAreaSamples(Spline, bSourceSpline, NavSystem, SafeProjectionExtent, MaxProjectionDistanceSq, OutSamples);
     }
 
-    return BuildPerimeterSamples(Spline, bSourceSpline, OutSamples);
+    return BuildPerimeterSamples(Spline, bSourceSpline, NavSystem, SafeProjectionExtent, MaxProjectionDistanceSq, OutSamples);
 }
 
-bool AOmniSplineNavLink::BuildPerimeterSamples(const USplineComponent& Spline, bool bSourceSpline, TArray<FProjectedSplineSample>& OutSamples)
+bool AOmniSplineNavLink::BuildPerimeterSamples(const USplineComponent& Spline, bool bSourceSpline, UNavigationSystemV1& NavSystem, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, TArray<FProjectedSplineSample>& OutSamples)
 {
     OutSamples.Reset();
 
@@ -506,7 +663,7 @@ bool AOmniSplineNavLink::BuildPerimeterSamples(const USplineComponent& Spline, b
         const FVector CandidateWorld = Spline.GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World);
 
         FVector ProjectedWorld;
-        if (!ProjectCandidate(CandidateWorld, ProjectedWorld))
+        if (!ProjectCandidate(NavSystem, CandidateWorld, SafeProjectionExtent, MaxProjectionDistanceSq, ProjectedWorld))
         {
             if (bSourceSpline)
             {
@@ -536,13 +693,13 @@ bool AOmniSplineNavLink::BuildPerimeterSamples(const USplineComponent& Spline, b
     return !OutSamples.IsEmpty();
 }
 
-bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, bool bSourceSpline, TArray<FProjectedSplineSample>& OutSamples)
+bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, bool bSourceSpline, UNavigationSystemV1& NavSystem, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, TArray<FProjectedSplineSample>& OutSamples)
 {
     OutSamples.Reset();
 
     if (!Spline.IsClosedLoop())
     {
-        return BuildPerimeterSamples(Spline, bSourceSpline, OutSamples);
+        return BuildPerimeterSamples(Spline, bSourceSpline, NavSystem, SafeProjectionExtent, MaxProjectionDistanceSq, OutSamples);
     }
 
     const float SplineLength = Spline.GetSplineLength();
@@ -590,11 +747,14 @@ bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, 
 
     AverageLocalZ /= static_cast<double>(BoundarySampleCount);
 
+    TArray<OmniSplineNavLinkPrivate::FPolygonEdge2D> LocalPolygonEdges;
+    OmniSplineNavLinkPrivate::BuildPolygonEdges(LocalPolygon, LocalPolygonEdges);
+
     const double Width = BoundsMax.X - BoundsMin.X;
     const double Height = BoundsMax.Y - BoundsMin.Y;
     if (Width <= KINDA_SMALL_NUMBER || Height <= KINDA_SMALL_NUMBER || LocalPolygon.Num() < 3)
     {
-        return BuildPerimeterSamples(Spline, bSourceSpline, OutSamples);
+        return BuildPerimeterSamples(Spline, bSourceSpline, NavSystem, SafeProjectionExtent, MaxProjectionDistanceSq, OutSamples);
     }
 
     int32 GridCountX = FMath::Max(1, FMath::CeilToInt(Width / SafeSpacing));
@@ -628,18 +788,32 @@ bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, 
 
     const FTransform SplineTransform = Spline.GetComponentTransform();
 
+    // Grid X coordinates are invariant for every row. Build them once instead of
+    // recomputing the same alpha/Lerp/normalization work for every candidate cell.
+    TArray<double> GridLocalX;
+    TArray<double> GridNormalizedX;
+    GridLocalX.Reserve(GridCountX);
+    GridNormalizedX.Reserve(GridCountX);
+    for (int32 XIndex = 0; XIndex < GridCountX; ++XIndex)
+    {
+        const double XAlpha = (static_cast<double>(XIndex) + 0.5) / static_cast<double>(GridCountX);
+        const double LocalX = FMath::Lerp(BoundsMin.X, BoundsMax.X, XAlpha);
+        GridLocalX.Add(LocalX);
+        GridNormalizedX.Add(Width <= KINDA_SMALL_NUMBER ? 0.5 : (LocalX - BoundsMin.X) / Width);
+    }
+
     for (int32 YIndex = 0; YIndex < GridCountY; ++YIndex)
     {
         const double YAlpha = (static_cast<double>(YIndex) + 0.5) / static_cast<double>(GridCountY);
         const double LocalY = FMath::Lerp(BoundsMin.Y, BoundsMax.Y, YAlpha);
+        const double NormalizedY = Height <= KINDA_SMALL_NUMBER ? 0.5 : (LocalY - BoundsMin.Y) / Height;
 
         for (int32 XIndex = 0; XIndex < GridCountX; ++XIndex)
         {
-            const double XAlpha = (static_cast<double>(XIndex) + 0.5) / static_cast<double>(GridCountX);
-            const double LocalX = FMath::Lerp(BoundsMin.X, BoundsMax.X, XAlpha);
+            const double LocalX = GridLocalX[XIndex];
             const FVector2D LocalPoint2D(LocalX, LocalY);
 
-            if (!IsPointInsidePolygon2D(LocalPoint2D, LocalPolygon))
+            if (!OmniSplineNavLinkPrivate::IsPointInsidePolygon2D(LocalPoint2D, LocalPolygonEdges))
             {
                 continue;
             }
@@ -650,7 +824,7 @@ bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, 
             const FVector CandidateWorld = SplineTransform.TransformPosition(CandidateLocal);
 
             FVector ProjectedWorld;
-            if (!ProjectCandidate(CandidateWorld, ProjectedWorld))
+            if (!ProjectCandidate(NavSystem, CandidateWorld, SafeProjectionExtent, MaxProjectionDistanceSq, ProjectedWorld))
             {
                 if (bSourceSpline)
                 {
@@ -665,7 +839,7 @@ bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, 
 
             // ProjectPointToNavigation can move the result laterally. Keep filled-area samples inside the authored boundary.
             const FVector ProjectedLocal = SplineTransform.InverseTransformPosition(ProjectedWorld);
-            if (!IsPointInsidePolygon2D(FVector2D(ProjectedLocal.X, ProjectedLocal.Y), LocalPolygon))
+            if (!OmniSplineNavLinkPrivate::IsPointInsidePolygon2D(FVector2D(ProjectedLocal.X, ProjectedLocal.Y), LocalPolygonEdges))
             {
                 if (bSourceSpline)
                 {
@@ -680,9 +854,7 @@ bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, 
 
             FProjectedSplineSample& Sample = OutSamples.Emplace_GetRef();
             Sample.ProjectedWorld = ProjectedWorld;
-            Sample.NormalizedArea = FVector2D(
-                Width <= KINDA_SMALL_NUMBER ? 0.5 : (LocalX - BoundsMin.X) / Width,
-                Height <= KINDA_SMALL_NUMBER ? 0.5 : (LocalY - BoundsMin.Y) / Height);
+            Sample.NormalizedArea = FVector2D(GridNormalizedX[XIndex], NormalizedY);
             Sample.bHasNormalizedArea = true;
 
             if (bSourceSpline)
@@ -708,24 +880,13 @@ bool AOmniSplineNavLink::BuildFilledAreaSamples(const USplineComponent& Spline, 
     return !OutSamples.IsEmpty();
 }
 
-bool AOmniSplineNavLink::ProjectCandidate(const FVector& CandidateWorld, FVector& OutProjectedWorld) const
+bool AOmniSplineNavLink::ProjectCandidate(UNavigationSystemV1& NavSystem, const FVector& CandidateWorld, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, FVector& OutProjectedWorld) const
 {
-    UNavigationSystemV1* NavSystem = UNavigationSystemV1::GetCurrent(GetWorld());
-    if (!NavSystem)
-    {
-        return false;
-    }
-
     FNavLocation ProjectedLocation;
-    const FVector SafeExtent(
-        FMath::Max(0.0, ProjectionExtent.X),
-        FMath::Max(0.0, ProjectionExtent.Y),
-        FMath::Max(0.0, ProjectionExtent.Z));
-
-    const bool bProjected = NavSystem->ProjectPointToNavigation(
+    const bool bProjected = NavSystem.ProjectPointToNavigation(
         CandidateWorld,
         ProjectedLocation,
-        SafeExtent,
+        SafeProjectionExtent,
         static_cast<const FNavAgentProperties*>(nullptr),
         FSharedConstNavQueryFilter());
 
@@ -734,23 +895,118 @@ bool AOmniSplineNavLink::ProjectCandidate(const FVector& CandidateWorld, FVector
         return false;
     }
 
-    if (MaximumProjectionDistance > 0.0f)
+    if (MaxProjectionDistanceSq >= 0.0
+        && FVector::DistSquared(CandidateWorld, ProjectedLocation.Location) > MaxProjectionDistanceSq)
     {
-        const double MaxProjectionDistanceSq = FMath::Square(static_cast<double>(MaximumProjectionDistance));
-        if (FVector::DistSquared(CandidateWorld, ProjectedLocation.Location) > MaxProjectionDistanceSq)
-        {
-            return false;
-        }
+        return false;
     }
 
     OutProjectedWorld = ProjectedLocation.Location;
     return true;
 }
 
-void AOmniSplineNavLink::BuildNearestPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const
+void AOmniSplineNavLink::BuildNearestPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const
 {
     OutPairs.Reset();
     OutPairs.Reserve(SourceSamples.Num() + TargetSamples.Num());
+
+    // Nearest pairing used to scan the entire opposite sample set for every sample.
+    // Keep the exact same nearest/usable semantics, but sort each side by world X once
+    // and expand outward from the query point. Once the X-axis separation alone is
+    // greater than the best full 3D distance found so far, no farther sample can win.
+    TArray<int32> SourceIndicesByX;
+    TArray<int32> TargetIndicesByX;
+    SourceIndicesByX.SetNumUninitialized(SourceSamples.Num());
+    TargetIndicesByX.SetNumUninitialized(TargetSamples.Num());
+
+    for (int32 Index = 0; Index < SourceSamples.Num(); ++Index)
+    {
+        SourceIndicesByX[Index] = Index;
+    }
+    for (int32 Index = 0; Index < TargetSamples.Num(); ++Index)
+    {
+        TargetIndicesByX[Index] = Index;
+    }
+
+    SourceIndicesByX.Sort([&SourceSamples](int32 A, int32 B)
+    {
+        const double AX = SourceSamples[A].ProjectedWorld.X;
+        const double BX = SourceSamples[B].ProjectedWorld.X;
+        return AX == BX ? A < B : AX < BX;
+    });
+    TargetIndicesByX.Sort([&TargetSamples](int32 A, int32 B)
+    {
+        const double AX = TargetSamples[A].ProjectedWorld.X;
+        const double BX = TargetSamples[B].ProjectedWorld.X;
+        return AX == BX ? A < B : AX < BX;
+    });
+
+    const auto FindNearestSpatial = [this, MaxLinkDistanceSq](const FVector& Point, bool bPointIsSource, const auto& Samples, const TArray<int32>& SortedIndices) -> int32
+    {
+        if (SortedIndices.IsEmpty())
+        {
+            return INDEX_NONE;
+        }
+
+        int32 Low = 0;
+        int32 High = SortedIndices.Num();
+        while (Low < High)
+        {
+            const int32 Mid = Low + (High - Low) / 2;
+            if (Samples[SortedIndices[Mid]].ProjectedWorld.X < Point.X)
+            {
+                Low = Mid + 1;
+            }
+            else
+            {
+                High = Mid;
+            }
+        }
+
+        int32 Left = Low - 1;
+        int32 Right = Low;
+        int32 BestIndex = INDEX_NONE;
+        double BestDistanceSq = TNumericLimits<double>::Max();
+
+        while (Left >= 0 || Right < SortedIndices.Num())
+        {
+            const double LeftDxSq = Left >= 0
+                ? FMath::Square(static_cast<double>(Samples[SortedIndices[Left]].ProjectedWorld.X - Point.X))
+                : TNumericLimits<double>::Max();
+            const double RightDxSq = Right < SortedIndices.Num()
+                ? FMath::Square(static_cast<double>(Samples[SortedIndices[Right]].ProjectedWorld.X - Point.X))
+                : TNumericLimits<double>::Max();
+
+            if (BestIndex != INDEX_NONE && LeftDxSq > BestDistanceSq && RightDxSq > BestDistanceSq)
+            {
+                break;
+            }
+
+            const bool bTakeLeft = LeftDxSq < RightDxSq
+                || (LeftDxSq == RightDxSq
+                    && Left >= 0
+                    && (Right >= SortedIndices.Num() || SortedIndices[Left] < SortedIndices[Right]));
+            const int32 SortedPosition = bTakeLeft ? Left-- : Right++;
+            const int32 CandidateIndex = SortedIndices[SortedPosition];
+
+            const FVector SourceWorld = bPointIsSource ? Point : Samples[CandidateIndex].ProjectedWorld;
+            const FVector TargetWorld = bPointIsSource ? Samples[CandidateIndex].ProjectedWorld : Point;
+            if (!IsPairUsable(SourceWorld, TargetWorld, MaxLinkDistanceSq))
+            {
+                continue;
+            }
+
+            const double DistanceSq = FVector::DistSquared(Point, Samples[CandidateIndex].ProjectedWorld);
+            if (DistanceSq < BestDistanceSq
+                || (DistanceSq == BestDistanceSq && (BestIndex == INDEX_NONE || CandidateIndex < BestIndex)))
+            {
+                BestDistanceSq = DistanceSq;
+                BestIndex = CandidateIndex;
+            }
+        }
+
+        return BestIndex;
+    };
 
     const int32 MaxCount = FMath::Max(SourceSamples.Num(), TargetSamples.Num());
     for (int32 Index = 0; Index < MaxCount; ++Index)
@@ -758,7 +1014,7 @@ void AOmniSplineNavLink::BuildNearestPairs(const TArray<FProjectedSplineSample>&
         if (Index < SourceSamples.Num())
         {
             const FProjectedSplineSample& SourceSample = SourceSamples[Index];
-            const int32 TargetIndex = FindNearestUsableSampleIndex(SourceSample.ProjectedWorld, true, TargetSamples);
+            const int32 TargetIndex = FindNearestSpatial(SourceSample.ProjectedWorld, true, TargetSamples, TargetIndicesByX);
             if (TargetIndex != INDEX_NONE)
             {
                 FProjectedPair& Pair = OutPairs.Emplace_GetRef();
@@ -770,7 +1026,7 @@ void AOmniSplineNavLink::BuildNearestPairs(const TArray<FProjectedSplineSample>&
         if (Index < TargetSamples.Num())
         {
             const FProjectedSplineSample& TargetSample = TargetSamples[Index];
-            const int32 SourceIndex = FindNearestUsableSampleIndex(TargetSample.ProjectedWorld, false, SourceSamples);
+            const int32 SourceIndex = FindNearestSpatial(TargetSample.ProjectedWorld, false, SourceSamples, SourceIndicesByX);
             if (SourceIndex != INDEX_NONE)
             {
                 FProjectedPair& Pair = OutPairs.Emplace_GetRef();
@@ -781,7 +1037,7 @@ void AOmniSplineNavLink::BuildNearestPairs(const TArray<FProjectedSplineSample>&
     }
 }
 
-void AOmniSplineNavLink::BuildMatchedPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, bool bWrapNormalizedDistance, TArray<FProjectedPair>& OutPairs) const
+void AOmniSplineNavLink::BuildMatchedPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, bool bWrapNormalizedDistance, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const
 {
     OutPairs.Reset();
 
@@ -797,14 +1053,126 @@ void AOmniSplineNavLink::BuildMatchedPairs(const TArray<FProjectedSplineSample>&
     OutPairs.Reserve(DriverSamples.Num());
     TBitArray<> UsedMatches(false, MatchSamples.Num());
 
+    // Matched spline pairing is one-to-one in normalized path distance. Sort the match
+    // side once, then expand around each query value instead of scanning every unused
+    // sample. Closed-loop matching evaluates the equivalent query positions at Q,
+    // Q - 1, and Q + 1; the minimum of those three exact linear searches is the same
+    // circular distance used previously.
+    TArray<int32> MatchIndicesByDistance;
+    MatchIndicesByDistance.SetNumUninitialized(MatchSamples.Num());
+    for (int32 Index = 0; Index < MatchSamples.Num(); ++Index)
+    {
+        MatchIndicesByDistance[Index] = Index;
+    }
+    MatchIndicesByDistance.Sort([&MatchSamples](int32 A, int32 B)
+    {
+        const double ADistance = MatchSamples[A].NormalizedDistance;
+        const double BDistance = MatchSamples[B].NormalizedDistance;
+        return ADistance == BDistance ? A < B : ADistance < BDistance;
+    });
+
+    const auto FindNearestUnusedLinear =
+        [this, bSourceDrives, &MatchSamples, &UsedMatches, &MatchIndicesByDistance, MaxLinkDistanceSq](const FProjectedSplineSample& DriverSample, double QueryValue) -> int32
+    {
+        int32 Low = 0;
+        int32 High = MatchIndicesByDistance.Num();
+        while (Low < High)
+        {
+            const int32 Mid = Low + (High - Low) / 2;
+            if (static_cast<double>(MatchSamples[MatchIndicesByDistance[Mid]].NormalizedDistance) < QueryValue)
+            {
+                Low = Mid + 1;
+            }
+            else
+            {
+                High = Mid;
+            }
+        }
+
+        int32 Left = Low - 1;
+        int32 Right = Low;
+        int32 BestIndex = INDEX_NONE;
+        double BestDistance = TNumericLimits<double>::Max();
+
+        while (Left >= 0 || Right < MatchIndicesByDistance.Num())
+        {
+            const double LeftDistance = Left >= 0
+                ? FMath::Abs(static_cast<double>(MatchSamples[MatchIndicesByDistance[Left]].NormalizedDistance) - QueryValue)
+                : TNumericLimits<double>::Max();
+            const double RightDistance = Right < MatchIndicesByDistance.Num()
+                ? FMath::Abs(static_cast<double>(MatchSamples[MatchIndicesByDistance[Right]].NormalizedDistance) - QueryValue)
+                : TNumericLimits<double>::Max();
+
+            if (BestIndex != INDEX_NONE && LeftDistance > BestDistance && RightDistance > BestDistance)
+            {
+                break;
+            }
+
+            const bool bTakeLeft = LeftDistance < RightDistance
+                || (LeftDistance == RightDistance
+                    && Left >= 0
+                    && (Right >= MatchIndicesByDistance.Num() || MatchIndicesByDistance[Left] < MatchIndicesByDistance[Right]));
+            const int32 SortedPosition = bTakeLeft ? Left-- : Right++;
+            const int32 CandidateIndex = MatchIndicesByDistance[SortedPosition];
+
+            if (UsedMatches[CandidateIndex])
+            {
+                continue;
+            }
+
+            const FVector SourceWorld = bSourceDrives ? DriverSample.ProjectedWorld : MatchSamples[CandidateIndex].ProjectedWorld;
+            const FVector TargetWorld = bSourceDrives ? MatchSamples[CandidateIndex].ProjectedWorld : DriverSample.ProjectedWorld;
+            if (!IsPairUsable(SourceWorld, TargetWorld, MaxLinkDistanceSq))
+            {
+                continue;
+            }
+
+            const double Distance = FMath::Abs(static_cast<double>(MatchSamples[CandidateIndex].NormalizedDistance) - QueryValue);
+            if (Distance < BestDistance
+                || (Distance == BestDistance && (BestIndex == INDEX_NONE || CandidateIndex < BestIndex)))
+            {
+                BestDistance = Distance;
+                BestIndex = CandidateIndex;
+            }
+        }
+
+        return BestIndex;
+    };
+
     for (const FProjectedSplineSample& DriverSample : DriverSamples)
     {
-        const int32 MatchIndex = FindNearestUnusedSampleByNormalizedDistance(
-            DriverSample,
-            bSourceDrives,
-            MatchSamples,
-            UsedMatches,
-            bWrapNormalizedDistance);
+        const double Query = static_cast<double>(DriverSample.NormalizedDistance);
+        int32 MatchIndex = FindNearestUnusedLinear(DriverSample, Query);
+        double BestCircularDistance = MatchIndex != INDEX_NONE
+            ? FMath::Abs(static_cast<double>(MatchSamples[MatchIndex].NormalizedDistance) - Query)
+            : TNumericLimits<double>::Max();
+
+        if (bWrapNormalizedDistance)
+        {
+            const int32 WrappedLowIndex = FindNearestUnusedLinear(DriverSample, Query - 1.0);
+            if (WrappedLowIndex != INDEX_NONE)
+            {
+                const double Distance = FMath::Abs(static_cast<double>(MatchSamples[WrappedLowIndex].NormalizedDistance) - (Query - 1.0));
+                if (Distance < BestCircularDistance
+                    || (Distance == BestCircularDistance && (MatchIndex == INDEX_NONE || WrappedLowIndex < MatchIndex)))
+                {
+                    BestCircularDistance = Distance;
+                    MatchIndex = WrappedLowIndex;
+                }
+            }
+
+            const int32 WrappedHighIndex = FindNearestUnusedLinear(DriverSample, Query + 1.0);
+            if (WrappedHighIndex != INDEX_NONE)
+            {
+                const double Distance = FMath::Abs(static_cast<double>(MatchSamples[WrappedHighIndex].NormalizedDistance) - (Query + 1.0));
+                if (Distance < BestCircularDistance
+                    || (Distance == BestCircularDistance && (MatchIndex == INDEX_NONE || WrappedHighIndex < MatchIndex)))
+                {
+                    BestCircularDistance = Distance;
+                    MatchIndex = WrappedHighIndex;
+                }
+            }
+        }
 
         if (MatchIndex == INDEX_NONE)
         {
@@ -827,7 +1195,7 @@ void AOmniSplineNavLink::BuildMatchedPairs(const TArray<FProjectedSplineSample>&
     }
 }
 
-void AOmniSplineNavLink::BuildMatchedAreaPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const
+void AOmniSplineNavLink::BuildMatchedAreaPairs(const TArray<FProjectedSplineSample>& SourceSamples, const TArray<FProjectedSplineSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const
 {
     OutPairs.Reset();
 
@@ -842,6 +1210,101 @@ void AOmniSplineNavLink::BuildMatchedAreaPairs(const TArray<FProjectedSplineSamp
 
     OutPairs.Reserve(DriverSamples.Num());
     TBitArray<> UsedMatches(false, MatchSamples.Num());
+
+    // Filled-area matching uses exact normalized-area distance. As with Volume Matched
+    // Grid, sorting by normalized X gives a safe lower bound for the full 2D distance:
+    // once both remaining X separations exceed the best exact 2D distance, no farther
+    // candidate can win.
+    int32 NormalizedAreaMatchCount = 0;
+    for (const FProjectedSplineSample& Sample : MatchSamples)
+    {
+        NormalizedAreaMatchCount += Sample.bHasNormalizedArea ? 1 : 0;
+    }
+
+    TArray<int32> MatchIndicesByAreaX;
+    MatchIndicesByAreaX.SetNumUninitialized(NormalizedAreaMatchCount);
+    int32 AreaWriteIndex = 0;
+    for (int32 Index = 0; Index < MatchSamples.Num(); ++Index)
+    {
+        if (MatchSamples[Index].bHasNormalizedArea)
+        {
+            MatchIndicesByAreaX[AreaWriteIndex++] = Index;
+        }
+    }
+    MatchIndicesByAreaX.Sort([&MatchSamples](int32 A, int32 B)
+    {
+        const double AX = MatchSamples[A].NormalizedArea.X;
+        const double BX = MatchSamples[B].NormalizedArea.X;
+        return AX == BX ? A < B : AX < BX;
+    });
+
+    const auto FindNearestUnusedArea =
+        [this, bSourceDrives, &MatchSamples, &UsedMatches, &MatchIndicesByAreaX, MaxLinkDistanceSq](const FProjectedSplineSample& DriverSample) -> int32
+    {
+        int32 Low = 0;
+        int32 High = MatchIndicesByAreaX.Num();
+        while (Low < High)
+        {
+            const int32 Mid = Low + (High - Low) / 2;
+            if (MatchSamples[MatchIndicesByAreaX[Mid]].NormalizedArea.X < DriverSample.NormalizedArea.X)
+            {
+                Low = Mid + 1;
+            }
+            else
+            {
+                High = Mid;
+            }
+        }
+
+        int32 Left = Low - 1;
+        int32 Right = Low;
+        int32 BestIndex = INDEX_NONE;
+        double BestDistanceSq = TNumericLimits<double>::Max();
+
+        while (Left >= 0 || Right < MatchIndicesByAreaX.Num())
+        {
+            const double LeftDxSq = Left >= 0
+                ? FMath::Square(static_cast<double>(MatchSamples[MatchIndicesByAreaX[Left]].NormalizedArea.X - DriverSample.NormalizedArea.X))
+                : TNumericLimits<double>::Max();
+            const double RightDxSq = Right < MatchIndicesByAreaX.Num()
+                ? FMath::Square(static_cast<double>(MatchSamples[MatchIndicesByAreaX[Right]].NormalizedArea.X - DriverSample.NormalizedArea.X))
+                : TNumericLimits<double>::Max();
+
+            if (BestIndex != INDEX_NONE && LeftDxSq > BestDistanceSq && RightDxSq > BestDistanceSq)
+            {
+                break;
+            }
+
+            const bool bTakeLeft = LeftDxSq < RightDxSq
+                || (LeftDxSq == RightDxSq
+                    && Left >= 0
+                    && (Right >= MatchIndicesByAreaX.Num() || MatchIndicesByAreaX[Left] < MatchIndicesByAreaX[Right]));
+            const int32 SortedPosition = bTakeLeft ? Left-- : Right++;
+            const int32 CandidateIndex = MatchIndicesByAreaX[SortedPosition];
+
+            if (UsedMatches[CandidateIndex])
+            {
+                continue;
+            }
+
+            const FVector SourceWorld = bSourceDrives ? DriverSample.ProjectedWorld : MatchSamples[CandidateIndex].ProjectedWorld;
+            const FVector TargetWorld = bSourceDrives ? MatchSamples[CandidateIndex].ProjectedWorld : DriverSample.ProjectedWorld;
+            if (!IsPairUsable(SourceWorld, TargetWorld, MaxLinkDistanceSq))
+            {
+                continue;
+            }
+
+            const double DistanceSq = FVector2D::DistSquared(DriverSample.NormalizedArea, MatchSamples[CandidateIndex].NormalizedArea);
+            if (DistanceSq < BestDistanceSq
+                || (DistanceSq == BestDistanceSq && (BestIndex == INDEX_NONE || CandidateIndex < BestIndex)))
+            {
+                BestDistanceSq = DistanceSq;
+                BestIndex = CandidateIndex;
+            }
+        }
+
+        return BestIndex;
+    };
 
     for (const FProjectedSplineSample& DriverSample : DriverSamples)
     {
@@ -850,7 +1313,7 @@ void AOmniSplineNavLink::BuildMatchedAreaPairs(const TArray<FProjectedSplineSamp
             continue;
         }
 
-        const int32 MatchIndex = FindNearestUnusedSampleByNormalizedArea(DriverSample, bSourceDrives, MatchSamples, UsedMatches);
+        const int32 MatchIndex = FindNearestUnusedArea(DriverSample);
         if (MatchIndex == INDEX_NONE)
         {
             continue;
@@ -872,24 +1335,21 @@ void AOmniSplineNavLink::BuildMatchedAreaPairs(const TArray<FProjectedSplineSamp
     }
 }
 
-bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks)
+bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, const FPairGenerationContext& Context, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks)
 {
     ++CandidateCount;
 
-    const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
+    const int32 SafeMaximumLinks = Context.SafeMaximumLinks;
     if (InOutLinks.Num() + InOutJumpLinks.Num() + InOutMantleLinks.Num() + InOutCustomLinks.Num() >= SafeMaximumLinks)
     {
         return false;
     }
 
-    if (MaximumLinkDistance > 0.0f)
+    if (Context.MaxLinkDistanceSq >= 0.0
+        && FVector::DistSquared(Pair.SourceWorld, Pair.TargetWorld) > Context.MaxLinkDistanceSq)
     {
-        const double MaxLinkDistanceSq = FMath::Square(static_cast<double>(MaximumLinkDistance));
-        if (FVector::DistSquared(Pair.SourceWorld, Pair.TargetWorld) > MaxLinkDistanceSq)
-        {
-            ++RejectedDistanceCount;
-            return false;
-        }
+        ++RejectedDistanceCount;
+        return false;
     }
 
     ENavLinkDirection::Type PairDirection = GetNativeDirection();
@@ -899,9 +1359,8 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return false;
     }
 
-    const double MergeDistance = static_cast<double>(FMath::Max(0.0f, EndpointMergeDistance));
-    const double MergeDistanceSq = FMath::Square(MergeDistance);
-    const double MergeCellSize = FMath::Max(1.0, MergeDistance);
+    const double MergeDistanceSq = Context.MergeDistanceSq;
+    const double MergeCellSize = Context.MergeCellSize;
     const auto ToMergeCell = [MergeCellSize](const FVector& Location)
     {
         return FIntVector(
@@ -951,13 +1410,8 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         ++HeightRestrictedLinkCount;
     }
 
-    UClass* ResolvedAreaClass = AreaClass.Get();
-    if (!ResolvedAreaClass)
-    {
-        ResolvedAreaClass = UNavArea_Default::StaticClass();
-    }
-
-    const FTransform LinkTransform = GeneratedLinks->GetComponentTransform();
+    UClass* ResolvedAreaClass = Context.ResolvedAreaClass;
+    const FTransform& LinkTransform = Context.LinkTransform;
 
     auto EmitRawLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
     {
@@ -1054,6 +1508,8 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         PreviewRejectedJumpPairs.Add(PreviewPair);
     };
 
+    const FOmniTraversalPlan* ActiveTraversalPlan = nullptr;
+
     auto ValidateJumpDirection = [&](ENavLinkDirection::Type Direction) -> bool
     {
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
@@ -1062,7 +1518,34 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         bool bTooFast = false;
         FVector BlockingLocation = FVector::ZeroVector;
         FString BlockingObject;
-        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject))
+        bool bSkipDepartureSupport = false;
+        bool bSkipDepartureClearance = false;
+        if (ActiveTraversalPlan)
+        {
+            const FOmniAutomaticDirectionDiagnostic& Diagnostic = Direction == ENavLinkDirection::RightToLeft
+                ? ActiveTraversalPlan->TargetToSourceAutomatic
+                : ActiveTraversalPlan->SourceToTargetAutomatic;
+
+            if (Diagnostic.bEvaluated && Diagnostic.bMantleValidationFallback && Diagnostic.bMantleValidationPerformed)
+            {
+                switch (Diagnostic.MantleValidationResult)
+                {
+                case EOmniMantleValidationResult::DepartureClearance:
+                    bSkipDepartureSupport = true;
+                    break;
+                case EOmniMantleValidationResult::PathBlocked:
+                case EOmniMantleValidationResult::LandingSupport:
+                case EOmniMantleValidationResult::LandingClearance:
+                    bSkipDepartureSupport = true;
+                    bSkipDepartureClearance = true;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+
+        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject, bSkipDepartureSupport, bSkipDepartureClearance))
         {
             return true;
         }
@@ -1112,7 +1595,7 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return false;
     };
 
-    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
+    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom, bool bMantleAlreadyValidated) -> bool
     {
         if (bUseCustom)
         {
@@ -1121,7 +1604,7 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
 
         if (bUseMantle)
         {
-            if (!bValidateMantlePath)
+            if (!bValidateMantlePath || bMantleAlreadyValidated)
             {
                 return EmitRawLink(Direction, false, true, false);
             }
@@ -1221,6 +1704,8 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         TargetToSourceTraversalAction,
         AutomaticSettings);
 
+    ActiveTraversalPlan = &TraversalPlan;
+
     if (UsesTraversalAction(EOmniTraversalAction::Automatic))
     {
         auto RecordAutomaticDiagnostic = [&](const FOmniAutomaticDirectionDiagnostic& Diagnostic, ENavLinkDirection::Type Direction)
@@ -1233,13 +1718,17 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
             if (Diagnostic.bMantleValidationFallback)
             {
                 ++AutomaticMantleValidationFallbackCount;
-                const FVector MantleStartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
-                const FVector MantleEndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
                 int32 FailureCode = 0;
-                FVector BlockingLocation = FVector::ZeroVector;
-                FString BlockingObject;
-                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode, &BlockingLocation, &BlockingObject);
-                RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
+                switch (Diagnostic.MantleValidationResult)
+                {
+                case EOmniMantleValidationResult::DepartureSupport: FailureCode = 1; break;
+                case EOmniMantleValidationResult::DepartureClearance: FailureCode = 2; break;
+                case EOmniMantleValidationResult::PathBlocked: FailureCode = 3; break;
+                case EOmniMantleValidationResult::LandingSupport: FailureCode = 4; break;
+                case EOmniMantleValidationResult::LandingClearance: FailureCode = 5; break;
+                default: FailureCode = 0; break;
+                }
+                RecordRejectedMantle(Direction, FailureCode, Diagnostic.MantleBlockingLocation, Diagnostic.MantleBlockingObject);
             }
 
             if (Diagnostic.bMantleLedgeFallback)
@@ -1283,7 +1772,33 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     for (int32 LegIndex = 0; LegIndex < TraversalPlan.LegCount; ++LegIndex)
     {
         const FOmniTraversalLeg& Leg = TraversalPlan.Legs[LegIndex];
-        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom);
+        auto HasValidatedAutomaticMantle = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
+        {
+            return Diagnostic.bEvaluated
+                && Diagnostic.bUseMantle
+                && Diagnostic.bMantleValidationPerformed
+                && Diagnostic.MantleValidationResult == EOmniMantleValidationResult::Valid;
+        };
+
+        bool bMantleAlreadyValidated = false;
+        if (Leg.bUseMantle)
+        {
+            if (Leg.Direction == ENavLinkDirection::LeftToRight)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.SourceToTargetAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::RightToLeft)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.TargetToSourceAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::BothWays)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.SourceToTargetAutomatic)
+                    && HasValidatedAutomaticMantle(TraversalPlan.TargetToSourceAutomatic);
+            }
+        }
+
+        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom, bMantleAlreadyValidated);
         if (bAdded && UsesTraversalAction(EOmniTraversalAction::Automatic) && PreviewGeneratedPairs.Num() > 0)
         {
             auto IsMantleFallback = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
@@ -1444,11 +1959,17 @@ int32 AOmniSplineNavLink::FindNearestUnusedSampleByNormalizedArea(const FProject
     return BestIndex;
 }
 
-bool AOmniSplineNavLink::IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld) const
+bool AOmniSplineNavLink::IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld, double MaxLinkDistanceSq) const
 {
-    if (MaximumLinkDistance > 0.0f)
+    if (MaxLinkDistanceSq < -1.0)
     {
-        const double MaxLinkDistanceSq = FMath::Square(static_cast<double>(MaximumLinkDistance));
+        MaxLinkDistanceSq = MaximumLinkDistance > 0.0f
+            ? FMath::Square(static_cast<double>(MaximumLinkDistance))
+            : -1.0;
+    }
+
+    if (MaxLinkDistanceSq >= 0.0)
+    {
         if (FVector::DistSquared(SourceWorld, TargetWorld) > MaxLinkDistanceSq)
         {
             return false;
@@ -1522,42 +2043,7 @@ bool AOmniSplineNavLink::ResolvePairDirection(const FVector& SourceWorld, const 
     }
 }
 
-bool AOmniSplineNavLink::IsPointInsidePolygon2D(const FVector2D& Point, const TArray<FVector2D>& Polygon)
-{
-    if (Polygon.Num() < 3)
-    {
-        return false;
-    }
-
-    bool bInside = false;
-    int32 PreviousIndex = Polygon.Num() - 1;
-
-    for (int32 Index = 0; Index < Polygon.Num(); ++Index)
-    {
-        const FVector2D& A = Polygon[Index];
-        const FVector2D& B = Polygon[PreviousIndex];
-
-        const bool bCrossesScanline = ((A.Y > Point.Y) != (B.Y > Point.Y));
-        if (bCrossesScanline)
-        {
-            const double Denominator = B.Y - A.Y;
-            if (!FMath::IsNearlyZero(Denominator))
-            {
-                const double CrossingX = (B.X - A.X) * (Point.Y - A.Y) / Denominator + A.X;
-                if (Point.X < CrossingX)
-                {
-                    bInside = !bInside;
-                }
-            }
-        }
-
-        PreviousIndex = Index;
-    }
-
-    return bInside;
-}
-
-bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject) const
+bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject, bool bSkipDepartureSupport, bool bSkipDepartureClearance) const
 {
     OutFailureCode = 0;
     bOutTooFast = false;
@@ -1569,6 +2055,8 @@ bool AOmniSplineNavLink::IsJumpDirectionValid(const FVector& StartWorld, const F
     Settings.AgentHalfHeight = JumpValidationAgentHalfHeight;
     Settings.MaxHorizontalSpeed = MaximumJumpHorizontalSpeed;
     Settings.ArcSegments = JumpValidationSegments;
+    Settings.bSkipDepartureSupport = bSkipDepartureSupport;
+    Settings.bSkipDepartureClearance = bSkipDepartureClearance;
 
     const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniJumpValidationResult::Valid)
@@ -2161,6 +2649,16 @@ void AOmniSplineNavLink::DrawEditorPreview() const
 }
 #endif
 
+bool AOmniSplineNavLink::CanRegenerateNow() const
+{
+    if (IsTemplate() || IsActorBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+    {
+        return false;
+    }
+
+    return GetWorld() != nullptr;
+}
+
 void AOmniSplineNavLink::NotifyNavigationSystem()
 {
     if (!GeneratedLinks || !GeneratedLinks->IsRegistered() || !GeneratedLinks->GetWorld())
@@ -2173,7 +2671,7 @@ void AOmniSplineNavLink::NotifyNavigationSystem()
 
 void AOmniSplineNavLink::BindNavigationGenerationDelegate()
 {
-    if (!bRegenerateAfterNavigationBuild || !GetWorld())
+    if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild)
     {
         return;
     }
@@ -2199,7 +2697,7 @@ void AOmniSplineNavLink::UnbindNavigationGenerationDelegate()
 
 void AOmniSplineNavLink::HandleNavigationGenerationFinished(ANavigationData* NavData)
 {
-    if (!bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
+    if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
     {
         return;
     }
@@ -2210,7 +2708,10 @@ void AOmniSplineNavLink::HandleNavigationGenerationFinished(ANavigationData* Nav
 #if WITH_EDITOR
 void AOmniSplineNavLink::QueueEditorRegeneration()
 {
-    bEditorRegenerationPending = true;
+    if (CanRegenerateNow())
+    {
+        bEditorRegenerationPending = true;
+    }
 }
 
 void AOmniSplineNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)

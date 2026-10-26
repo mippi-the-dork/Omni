@@ -25,6 +25,27 @@ void UOmniJumpTraversalComponent::RebuildLinks(
     float InLandingTolerance,
     float InTraversalTimeout)
 {
+    AActor* Owner = GetOwner();
+    if (!Owner)
+    {
+        ClearLinks();
+        return;
+    }
+
+    // Cached specs are only reusable while the transient smart-link components
+    // that implement them still belong to this actor. Editor reconstruction,
+    // Undo/Redo, or component teardown can invalidate those objects without
+    // changing the authored link specs. Rebuild from a clean state when that
+    // happens instead of letting an equal-config fast path preserve stale links.
+    for (const UNavLinkCustomComponent* Link : JumpLinks)
+    {
+        if (!IsValid(Link) || Link->GetOwner() != Owner)
+        {
+            ClearLinks();
+            break;
+        }
+    }
+
     if (IsConfigurationEquivalent(LinkSpecs, InSupportedAgents, AreaClass, InJumpApexHeight, InLandingTolerance, InTraversalTimeout))
     {
         return;
@@ -33,13 +54,6 @@ void UOmniJumpTraversalComponent::RebuildLinks(
     JumpApexHeight = FMath::Max(1.0f, InJumpApexHeight);
     LandingTolerance = FMath::Max(1.0f, InLandingTolerance);
     TraversalTimeout = FMath::Max(0.25f, InTraversalTimeout);
-
-    AActor* Owner = GetOwner();
-    if (!Owner)
-    {
-        ClearLinks();
-        return;
-    }
 
     while (JumpLinks.Num() > LinkSpecs.Num())
     {
@@ -132,7 +146,7 @@ void UOmniJumpTraversalComponent::ClearLinks()
     {
         for (UNavLinkCustomComponent* Link : JumpLinks)
         {
-            if (Link)
+            if (IsValid(Link) && Link->GetOwner() == Owner)
             {
                 Owner->RemoveInstanceComponent(Link);
                 Link->DestroyComponent();
@@ -284,17 +298,19 @@ bool UOmniJumpTraversalComponent::IsConfigurationEquivalent(
         return false;
     }
 
-    if (const AActor* Owner = GetOwner())
+    const AActor* Owner = GetOwner();
+    if (!Owner)
     {
-        if (Owner->GetWorld())
+        return false;
+    }
+
+    for (const UNavLinkCustomComponent* Link : JumpLinks)
+    {
+        if (!IsValid(Link)
+            || Link->GetOwner() != Owner
+            || (Owner->GetWorld() && !Link->IsRegistered()))
         {
-            for (const UNavLinkCustomComponent* Link : JumpLinks)
-            {
-                if (!Link || !Link->IsRegistered())
-                {
-                    return false;
-                }
-            }
+            return false;
         }
     }
 

@@ -19,19 +19,33 @@ void UOmniCustomTraversalComponent::RebuildLinks(
     TSubclassOf<UNavAreaBase> AreaClass,
     float InTraversalTimeout)
 {
-    if (IsConfigurationEquivalent(LinkSpecs, InSupportedAgents, AreaClass, InTraversalTimeout))
-    {
-        return;
-    }
-
-    TraversalTimeout = FMath::Max(0.25f, InTraversalTimeout);
-
     AActor* Owner = GetOwner();
     if (!Owner)
     {
         ClearLinks();
         return;
     }
+
+    // Cached specs are only reusable while the transient smart-link components
+    // that implement them still belong to this actor. Editor reconstruction,
+    // Undo/Redo, or component teardown can invalidate those objects without
+    // changing the authored link specs. Rebuild from a clean state when that
+    // happens instead of letting an equal-config fast path preserve stale links.
+    for (const UNavLinkCustomComponent* Link : CustomLinks)
+    {
+        if (!IsValid(Link) || Link->GetOwner() != Owner)
+        {
+            ClearLinks();
+            break;
+        }
+    }
+
+    if (IsConfigurationEquivalent(LinkSpecs, InSupportedAgents, AreaClass, InTraversalTimeout))
+    {
+        return;
+    }
+
+    TraversalTimeout = FMath::Max(0.25f, InTraversalTimeout);
 
     while (CustomLinks.Num() > LinkSpecs.Num())
     {
@@ -124,7 +138,7 @@ void UOmniCustomTraversalComponent::ClearLinks()
     {
         for (UNavLinkCustomComponent* Link : CustomLinks)
         {
-            if (Link)
+            if (IsValid(Link) && Link->GetOwner() == Owner)
             {
                 Owner->RemoveInstanceComponent(Link);
                 Link->DestroyComponent();
@@ -389,17 +403,19 @@ bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
         return false;
     }
 
-    if (const AActor* Owner = GetOwner())
+    const AActor* Owner = GetOwner();
+    if (!Owner)
     {
-        if (Owner->GetWorld())
+        return false;
+    }
+
+    for (const UNavLinkCustomComponent* Link : CustomLinks)
+    {
+        if (!IsValid(Link)
+            || Link->GetOwner() != Owner
+            || (Owner->GetWorld() && !Link->IsRegistered()))
         {
-            for (const UNavLinkCustomComponent* Link : CustomLinks)
-            {
-                if (!Link || !Link->IsRegistered())
-                {
-                    return false;
-                }
-            }
+            return false;
         }
     }
 

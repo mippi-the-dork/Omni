@@ -45,6 +45,8 @@ public:
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void PostRegisterAllComponents() override;
     virtual void PostUnregisterAllComponents() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void Destroyed() override;
     virtual void Tick(float DeltaSeconds) override;
 
 #if WITH_EDITOR
@@ -417,7 +419,7 @@ private:
     bool GenerateProjectedConnection(const FVector& SourceWorld, const FVector& TargetWorld, TArray<FNavigationLink>& OutNativeLinks, TArray<FOmniJumpLinkSpec>& OutJumpLinks, TArray<FOmniMantleLinkSpec>& OutMantleLinks, TArray<FOmniCustomLinkSpec>& OutCustomLinks);
     bool IsTraversalAllowedByHeight(const FVector& StartWorld, const FVector& EndWorld) const;
     bool ResolvePairDirection(const FVector& SourceWorld, const FVector& TargetWorld, ENavLinkDirection::Type& OutDirection, bool& bOutHeightRestricted) const;
-    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr) const;
+    bool IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr, bool bSkipDepartureSupport = false, bool bSkipDepartureClearance = false) const;
     bool IsMantleDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, FVector* OutBlockingLocation = nullptr, FString* OutBlockingObject = nullptr) const;
     bool AreLinkArraysEquivalent(const TArray<FNavigationLink>& A, const TArray<FNavigationLink>& B) const;
     ENavLinkDirection::Type GetNativeDirection() const;
@@ -425,6 +427,7 @@ private:
     void UpdateGenerationStatus();
     void ApplyEditorVisualStyle();
     void ResetDebugState();
+    bool CanRegenerateNow() const;
     void NotifyNavigationSystem();
     void BindNavigationGenerationDelegate();
     void UnbindNavigationGenerationDelegate();

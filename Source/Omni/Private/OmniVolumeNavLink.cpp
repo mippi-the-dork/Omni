@@ -106,8 +106,63 @@ void AOmniVolumeNavLink::PostRegisterAllComponents()
 
 void AOmniVolumeNavLink::PostUnregisterAllComponents()
 {
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
     UnbindNavigationGenerationDelegate();
     Super::PostUnregisterAllComponents();
+}
+
+void AOmniVolumeNavLink::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+    UnbindNavigationGenerationDelegate();
+
+    // EndPlay covers PIE stop, level transitions, streamed-level removal, and
+    // runtime destruction. Release paused path following before the generated
+    // smart-link components leave the world.
+    if (JumpTraversal)
+    {
+        JumpTraversal->ClearLinks();
+    }
+    if (MantleTraversal)
+    {
+        MantleTraversal->ClearLinks();
+    }
+    if (CustomTraversal)
+    {
+        CustomTraversal->ClearLinks();
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
+void AOmniVolumeNavLink::Destroyed()
+{
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+    UnbindNavigationGenerationDelegate();
+
+    // Release any AI currently paused on an Omni smart link before the actor's
+    // components are torn down. This keeps deletion, PIE shutdown, and level
+    // teardown from leaving path following waiting on a link that no longer exists.
+    if (JumpTraversal)
+    {
+        JumpTraversal->ClearLinks();
+    }
+    if (MantleTraversal)
+    {
+        MantleTraversal->ClearLinks();
+    }
+    if (CustomTraversal)
+    {
+        CustomTraversal->ClearLinks();
+    }
+
+    Super::Destroyed();
 }
 
 void AOmniVolumeNavLink::Tick(float DeltaSeconds)
@@ -118,7 +173,7 @@ void AOmniVolumeNavLink::Tick(float DeltaSeconds)
     if (bEditorRegenerationPending)
     {
         bEditorRegenerationPending = false;
-        if (bAutoRegenerate)
+        if (bAutoRegenerate && CanRegenerateNow())
         {
             RegenerateLinks();
         }
@@ -214,7 +269,7 @@ void AOmniVolumeNavLink::RecheckDiagnostics()
 
 void AOmniVolumeNavLink::RegenerateLinks()
 {
-    if (bIsRegenerating || !GeneratedLinks || !SourceBox || !TargetBox)
+    if (bIsRegenerating || !CanRegenerateNow() || !GeneratedLinks || !SourceBox || !TargetBox)
     {
         return;
     }
@@ -235,15 +290,35 @@ void AOmniVolumeNavLink::RegenerateLinks()
     if (bEnabled)
     {
         const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
-        NewLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
-        NewJumpLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
-        NewMantleLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
-        NewCustomLinks.Reserve(FMath::Min(SafeMaximumLinks, 256));
+        FPairGenerationContext PairContext;
+        PairContext.SafeMaximumLinks = SafeMaximumLinks;
+        PairContext.MaxLinkDistanceSq = MaximumLinkDistance > 0.0f
+            ? FMath::Square(static_cast<double>(MaximumLinkDistance))
+            : -1.0;
+        const double MergeDistance = static_cast<double>(FMath::Max(0.0f, EndpointMergeDistance));
+        PairContext.MergeDistanceSq = FMath::Square(MergeDistance);
+        PairContext.MergeCellSize = FMath::Max(1.0, MergeDistance);
+        PairContext.LinkTransform = GeneratedLinks->GetComponentTransform();
+        PairContext.ResolvedAreaClass = AreaClass.Get();
+        if (!PairContext.ResolvedAreaClass)
+        {
+            PairContext.ResolvedAreaClass = UNavArea_Default::StaticClass();
+        }
+
+        NewLinks.Reserve(SafeMaximumLinks);
+        NewJumpLinks.Reserve(SafeMaximumLinks);
+        NewMantleLinks.Reserve(SafeMaximumLinks);
+        NewCustomLinks.Reserve(SafeMaximumLinks);
+        PreviewGeneratedPairs.Reserve(SafeMaximumLinks);
+        PreviewPairMergeBuckets.Reserve(SafeMaximumLinks);
 
         TArray<FProjectedGridSample> SourceSamples;
         TArray<FProjectedGridSample> TargetSamples;
-        BuildProjectedGrid(*SourceBox, true, SourceSamples);
-        BuildProjectedGrid(*TargetBox, false, TargetSamples);
+        if (UNavigationSystemV1* NavSystem = UNavigationSystemV1::GetCurrent(GetWorld()))
+        {
+            BuildProjectedGrid(*SourceBox, true, *NavSystem, SourceSamples);
+            BuildProjectedGrid(*TargetBox, false, *NavSystem, TargetSamples);
+        }
 
         ValidSourceSampleCount = SourceSamples.Num();
         ValidTargetSampleCount = TargetSamples.Num();
@@ -255,37 +330,55 @@ void AOmniVolumeNavLink::RegenerateLinks()
 
             if (PairingMode == EOmniPairingMode::MatchedGrid)
             {
-                BuildMatchedGridPairs(SourceSamples, TargetSamples, CandidatePairs);
+                BuildMatchedGridPairs(SourceSamples, TargetSamples, PairContext.MaxLinkDistanceSq, CandidatePairs);
             }
             else
             {
-                BuildNearestPairs(SourceSamples, TargetSamples, CandidatePairs);
+                BuildNearestPairs(SourceSamples, TargetSamples, PairContext.MaxLinkDistanceSq, CandidatePairs);
             }
 
-            auto GeneratedCount = [&NewLinks, &NewJumpLinks, &NewMantleLinks, &NewCustomLinks]()
-            {
-                return NewLinks.Num() + NewJumpLinks.Num() + NewMantleLinks.Num() + NewCustomLinks.Num();
-            };
+            int32 GeneratedCount = 0;
 
-            TBitArray<> AttemptedPairs(false, CandidatePairs.Num());
             const int32 SpreadAttemptCount = FMath::Min(SafeMaximumLinks, CandidatePairs.Num());
-            for (int32 AttemptIndex = 0; AttemptIndex < SpreadAttemptCount && GeneratedCount() < SafeMaximumLinks; ++AttemptIndex)
+            TArray<int32> SpreadPairIndices;
+            SpreadPairIndices.Reserve(SpreadAttemptCount);
+            for (int32 AttemptIndex = 0; AttemptIndex < SpreadAttemptCount; ++AttemptIndex)
             {
                 const int32 PairIndex = SpreadAttemptCount <= 1
                     ? CandidatePairs.Num() / 2
                     : FMath::RoundToInt(
                         static_cast<double>(AttemptIndex) * static_cast<double>(CandidatePairs.Num() - 1)
                         / static_cast<double>(SpreadAttemptCount - 1));
-
-                AttemptedPairs[PairIndex] = true;
-                AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks);
+                SpreadPairIndices.Add(PairIndex);
             }
 
-            for (int32 PairIndex = 0; PairIndex < CandidatePairs.Num() && GeneratedCount() < SafeMaximumLinks; ++PairIndex)
+            for (const int32 PairIndex : SpreadPairIndices)
             {
-                if (!AttemptedPairs[PairIndex])
+                if (GeneratedCount >= SafeMaximumLinks)
                 {
-                    AddProjectedPair(CandidatePairs[PairIndex], NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks);
+                    break;
+                }
+
+                if (AddProjectedPair(CandidatePairs[PairIndex], PairContext, NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks))
+                {
+                    ++GeneratedCount;
+                }
+            }
+
+            int32 SpreadIndexCursor = 0;
+            for (int32 PairIndex = 0; PairIndex < CandidatePairs.Num() && GeneratedCount < SafeMaximumLinks; ++PairIndex)
+            {
+                while (SpreadIndexCursor < SpreadPairIndices.Num() && SpreadPairIndices[SpreadIndexCursor] < PairIndex)
+                {
+                    ++SpreadIndexCursor;
+                }
+
+                const bool bWasSpreadAttempt = SpreadIndexCursor < SpreadPairIndices.Num()
+                    && SpreadPairIndices[SpreadIndexCursor] == PairIndex;
+                if (!bWasSpreadAttempt
+                    && AddProjectedPair(CandidatePairs[PairIndex], PairContext, NewLinks, NewJumpLinks, NewMantleLinks, NewCustomLinks))
+                {
+                    ++GeneratedCount;
                 }
             }
         }
@@ -405,13 +498,17 @@ void AOmniVolumeNavLink::ResetVolumes()
     RegenerateLinks();
 }
 
-bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSourceVolume, TArray<FProjectedGridSample>& OutSamples)
+bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSourceVolume, UNavigationSystemV1& NavSystem, TArray<FProjectedGridSample>& OutSamples)
 {
     OutSamples.Reset();
 
+    // Cache immutable box/containment data once for this grid build. Dense volumes can
+    // project hundreds or thousands of candidates, so re-reading the component transform,
+    // extent, and containment tolerance for every projected point is unnecessary work.
     const FVector Extent = Box.GetUnscaledBoxExtent();
     const FTransform BoxTransform = Box.GetComponentTransform();
     const FVector Scale = BoxTransform.GetScale3D();
+    const double ContainmentTolerance = FMath::Max(0.0f, ProjectionContainmentTolerance);
 
     const double WorldLengthX = 2.0 * Extent.X * FMath::Abs(Scale.X);
     const double WorldLengthY = 2.0 * Extent.Y * FMath::Abs(Scale.Y);
@@ -460,6 +557,31 @@ bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSour
 
     OutSamples.Reserve(RawGridCount);
 
+    const FVector SafeProjectionExtent(
+        FMath::Max(0.0, ProjectionExtent.X),
+        FMath::Max(0.0, ProjectionExtent.Y),
+        FMath::Max(0.0, ProjectionExtent.Z));
+    const double MaxProjectionDistanceSq = MaximumProjectionDistance > 0.0f
+        ? FMath::Square(static_cast<double>(MaximumProjectionDistance))
+        : -1.0;
+
+    // Every row uses the same X-axis positions and normalized grid coordinates.
+    // Build them once so dense grids do not repeat the same division and Lerp work
+    // for every Y row. The arrays are sized exactly because SampleCountX is final.
+    TArray<double> GridLocalX;
+    TArray<double> GridXAlpha;
+    GridLocalX.SetNumUninitialized(SampleCountX);
+    GridXAlpha.SetNumUninitialized(SampleCountX);
+
+    for (int32 XIndex = 0; XIndex < SampleCountX; ++XIndex)
+    {
+        const double XAlpha = SampleCountX <= 1
+            ? 0.5
+            : static_cast<double>(XIndex) / static_cast<double>(SampleCountX - 1);
+        GridXAlpha[XIndex] = XAlpha;
+        GridLocalX[XIndex] = FMath::Lerp(-Extent.X, Extent.X, XAlpha);
+    }
+
     for (int32 YIndex = 0; YIndex < SampleCountY; ++YIndex)
     {
         const double YAlpha = SampleCountY <= 1
@@ -469,16 +591,14 @@ bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSour
 
         for (int32 XIndex = 0; XIndex < SampleCountX; ++XIndex)
         {
-            const double XAlpha = SampleCountX <= 1
-                ? 0.5
-                : static_cast<double>(XIndex) / static_cast<double>(SampleCountX - 1);
-            const double LocalX = FMath::Lerp(-Extent.X, Extent.X, XAlpha);
+            const double XAlpha = GridXAlpha[XIndex];
+            const double LocalX = GridLocalX[XIndex];
 
             const FVector CandidateWorld = BoxTransform.TransformPosition(FVector(LocalX, LocalY, 0.0));
 
             FVector ProjectedWorld;
             bool bOutsideVolume = false;
-            if (!ProjectCandidate(CandidateWorld, Box, ProjectedWorld, bOutsideVolume))
+            if (!ProjectCandidate(NavSystem, CandidateWorld, BoxTransform, Extent, ContainmentTolerance, SafeProjectionExtent, MaxProjectionDistanceSq, ProjectedWorld, bOutsideVolume))
             {
                 if (bOutsideVolume)
                 {
@@ -513,26 +633,15 @@ bool AOmniVolumeNavLink::BuildProjectedGrid(const UBoxComponent& Box, bool bSour
     return !OutSamples.IsEmpty();
 }
 
-bool AOmniVolumeNavLink::ProjectCandidate(const FVector& CandidateWorld, const UBoxComponent& OwnerBox, FVector& OutProjectedWorld, bool& bOutOutsideVolume) const
+bool AOmniVolumeNavLink::ProjectCandidate(UNavigationSystemV1& NavSystem, const FVector& CandidateWorld, const FTransform& OwnerBoxTransform, const FVector& OwnerBoxExtent, double ContainmentTolerance, const FVector& SafeProjectionExtent, double MaxProjectionDistanceSq, FVector& OutProjectedWorld, bool& bOutOutsideVolume) const
 {
     bOutOutsideVolume = false;
 
-    UNavigationSystemV1* NavSystem = UNavigationSystemV1::GetCurrent(GetWorld());
-    if (!NavSystem)
-    {
-        return false;
-    }
-
     FNavLocation ProjectedLocation;
-    const FVector SafeExtent(
-        FMath::Max(0.0, ProjectionExtent.X),
-        FMath::Max(0.0, ProjectionExtent.Y),
-        FMath::Max(0.0, ProjectionExtent.Z));
-
-    const bool bProjected = NavSystem->ProjectPointToNavigation(
+    const bool bProjected = NavSystem.ProjectPointToNavigation(
         CandidateWorld,
         ProjectedLocation,
-        SafeExtent,
+        SafeProjectionExtent,
         static_cast<const FNavAgentProperties*>(nullptr),
         FSharedConstNavQueryFilter());
 
@@ -541,16 +650,13 @@ bool AOmniVolumeNavLink::ProjectCandidate(const FVector& CandidateWorld, const U
         return false;
     }
 
-    if (MaximumProjectionDistance > 0.0f)
+    if (MaxProjectionDistanceSq >= 0.0
+        && FVector::DistSquared(CandidateWorld, ProjectedLocation.Location) > MaxProjectionDistanceSq)
     {
-        const double MaxProjectionDistanceSq = FMath::Square(static_cast<double>(MaximumProjectionDistance));
-        if (FVector::DistSquared(CandidateWorld, ProjectedLocation.Location) > MaxProjectionDistanceSq)
-        {
-            return false;
-        }
+        return false;
     }
 
-    if (!IsProjectedPointInsideBox(ProjectedLocation.Location, OwnerBox))
+    if (!IsProjectedPointInsideBox(ProjectedLocation.Location, OwnerBoxTransform, OwnerBoxExtent, ContainmentTolerance))
     {
         bOutOutsideVolume = true;
         return false;
@@ -560,21 +666,117 @@ bool AOmniVolumeNavLink::ProjectCandidate(const FVector& CandidateWorld, const U
     return true;
 }
 
-bool AOmniVolumeNavLink::IsProjectedPointInsideBox(const FVector& WorldPoint, const UBoxComponent& Box) const
+bool AOmniVolumeNavLink::IsProjectedPointInsideBox(const FVector& WorldPoint, const FTransform& BoxTransform, const FVector& Extent, double Tolerance) const
 {
-    const FVector LocalPoint = Box.GetComponentTransform().InverseTransformPosition(WorldPoint);
-    const FVector Extent = Box.GetUnscaledBoxExtent();
-    const double Tolerance = FMath::Max(0.0f, ProjectionContainmentTolerance);
+    const FVector LocalPoint = BoxTransform.InverseTransformPosition(WorldPoint);
 
     return FMath::Abs(LocalPoint.X) <= Extent.X + Tolerance
         && FMath::Abs(LocalPoint.Y) <= Extent.Y + Tolerance
         && FMath::Abs(LocalPoint.Z) <= Extent.Z + Tolerance;
 }
 
-void AOmniVolumeNavLink::BuildNearestPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const
+void AOmniVolumeNavLink::BuildNearestPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const
 {
     OutPairs.Reset();
     OutPairs.Reserve(SourceSamples.Num() + TargetSamples.Num());
+
+    // Nearest pairing used to scan the entire opposite sample set for every sample.
+    // Keep the exact same nearest/usable semantics, but sort each side by world X once
+    // and expand outward from the query point. Once the X-axis separation alone is
+    // greater than the best full 3D distance found so far, no farther sample can win.
+    TArray<int32> SourceIndicesByX;
+    TArray<int32> TargetIndicesByX;
+    SourceIndicesByX.SetNumUninitialized(SourceSamples.Num());
+    TargetIndicesByX.SetNumUninitialized(TargetSamples.Num());
+
+    for (int32 Index = 0; Index < SourceSamples.Num(); ++Index)
+    {
+        SourceIndicesByX[Index] = Index;
+    }
+    for (int32 Index = 0; Index < TargetSamples.Num(); ++Index)
+    {
+        TargetIndicesByX[Index] = Index;
+    }
+
+    SourceIndicesByX.Sort([&SourceSamples](int32 A, int32 B)
+    {
+        const double AX = SourceSamples[A].ProjectedWorld.X;
+        const double BX = SourceSamples[B].ProjectedWorld.X;
+        return AX == BX ? A < B : AX < BX;
+    });
+    TargetIndicesByX.Sort([&TargetSamples](int32 A, int32 B)
+    {
+        const double AX = TargetSamples[A].ProjectedWorld.X;
+        const double BX = TargetSamples[B].ProjectedWorld.X;
+        return AX == BX ? A < B : AX < BX;
+    });
+
+    const auto FindNearestSpatial = [this, MaxLinkDistanceSq](const FVector& Point, bool bPointIsSource, const auto& Samples, const TArray<int32>& SortedIndices) -> int32
+    {
+        if (SortedIndices.IsEmpty())
+        {
+            return INDEX_NONE;
+        }
+
+        int32 Low = 0;
+        int32 High = SortedIndices.Num();
+        while (Low < High)
+        {
+            const int32 Mid = Low + (High - Low) / 2;
+            if (Samples[SortedIndices[Mid]].ProjectedWorld.X < Point.X)
+            {
+                Low = Mid + 1;
+            }
+            else
+            {
+                High = Mid;
+            }
+        }
+
+        int32 Left = Low - 1;
+        int32 Right = Low;
+        int32 BestIndex = INDEX_NONE;
+        double BestDistanceSq = TNumericLimits<double>::Max();
+
+        while (Left >= 0 || Right < SortedIndices.Num())
+        {
+            const double LeftDxSq = Left >= 0
+                ? FMath::Square(static_cast<double>(Samples[SortedIndices[Left]].ProjectedWorld.X - Point.X))
+                : TNumericLimits<double>::Max();
+            const double RightDxSq = Right < SortedIndices.Num()
+                ? FMath::Square(static_cast<double>(Samples[SortedIndices[Right]].ProjectedWorld.X - Point.X))
+                : TNumericLimits<double>::Max();
+
+            if (BestIndex != INDEX_NONE && LeftDxSq > BestDistanceSq && RightDxSq > BestDistanceSq)
+            {
+                break;
+            }
+
+            const bool bTakeLeft = LeftDxSq < RightDxSq
+                || (LeftDxSq == RightDxSq
+                    && Left >= 0
+                    && (Right >= SortedIndices.Num() || SortedIndices[Left] < SortedIndices[Right]));
+            const int32 SortedPosition = bTakeLeft ? Left-- : Right++;
+            const int32 CandidateIndex = SortedIndices[SortedPosition];
+
+            const FVector SourceWorld = bPointIsSource ? Point : Samples[CandidateIndex].ProjectedWorld;
+            const FVector TargetWorld = bPointIsSource ? Samples[CandidateIndex].ProjectedWorld : Point;
+            if (!IsPairUsable(SourceWorld, TargetWorld, MaxLinkDistanceSq))
+            {
+                continue;
+            }
+
+            const double DistanceSq = FVector::DistSquared(Point, Samples[CandidateIndex].ProjectedWorld);
+            if (DistanceSq < BestDistanceSq
+                || (DistanceSq == BestDistanceSq && (BestIndex == INDEX_NONE || CandidateIndex < BestIndex)))
+            {
+                BestDistanceSq = DistanceSq;
+                BestIndex = CandidateIndex;
+            }
+        }
+
+        return BestIndex;
+    };
 
     const int32 MaxCount = FMath::Max(SourceSamples.Num(), TargetSamples.Num());
     for (int32 Index = 0; Index < MaxCount; ++Index)
@@ -582,7 +784,7 @@ void AOmniVolumeNavLink::BuildNearestPairs(const TArray<FProjectedGridSample>& S
         if (Index < SourceSamples.Num())
         {
             const FProjectedGridSample& SourceSample = SourceSamples[Index];
-            const int32 TargetIndex = FindNearestUsableSampleIndex(SourceSample.ProjectedWorld, true, TargetSamples);
+            const int32 TargetIndex = FindNearestSpatial(SourceSample.ProjectedWorld, true, TargetSamples, TargetIndicesByX);
             if (TargetIndex != INDEX_NONE)
             {
                 FProjectedPair& Pair = OutPairs.Emplace_GetRef();
@@ -594,7 +796,7 @@ void AOmniVolumeNavLink::BuildNearestPairs(const TArray<FProjectedGridSample>& S
         if (Index < TargetSamples.Num())
         {
             const FProjectedGridSample& TargetSample = TargetSamples[Index];
-            const int32 SourceIndex = FindNearestUsableSampleIndex(TargetSample.ProjectedWorld, false, SourceSamples);
+            const int32 SourceIndex = FindNearestSpatial(TargetSample.ProjectedWorld, false, SourceSamples, SourceIndicesByX);
             if (SourceIndex != INDEX_NONE)
             {
                 FProjectedPair& Pair = OutPairs.Emplace_GetRef();
@@ -605,7 +807,7 @@ void AOmniVolumeNavLink::BuildNearestPairs(const TArray<FProjectedGridSample>& S
     }
 }
 
-void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, TArray<FProjectedPair>& OutPairs) const
+void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample>& SourceSamples, const TArray<FProjectedGridSample>& TargetSamples, double MaxLinkDistanceSq, TArray<FProjectedPair>& OutPairs) const
 {
     OutPairs.Reset();
 
@@ -618,6 +820,13 @@ void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample
     // samples drives the pairing, and each sample on the other side may be used only
     // once. Matching happens in normalized local grid coordinates rather than world
     // space, so correspondence survives different box sizes, offsets, and rotation.
+    //
+    // The previous implementation scanned every unused match sample for every driver
+    // sample. Sort once by normalized U and expand outward from the query instead.
+    // Because full UV distance can never be smaller than the U-axis separation, the
+    // search can stop once both remaining U distances are already worse than the best
+    // exact UV distance found. IsPairUsable and deterministic lower-index ties remain
+    // exactly the same.
     const bool bSourceDrives = SourceSamples.Num() <= TargetSamples.Num();
     const TArray<FProjectedGridSample>& DriverSamples = bSourceDrives ? SourceSamples : TargetSamples;
     const TArray<FProjectedGridSample>& MatchSamples = bSourceDrives ? TargetSamples : SourceSamples;
@@ -625,9 +834,90 @@ void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample
     OutPairs.Reserve(DriverSamples.Num());
     TBitArray<> UsedMatches(false, MatchSamples.Num());
 
+    TArray<int32> MatchIndicesByU;
+    MatchIndicesByU.SetNumUninitialized(MatchSamples.Num());
+    for (int32 Index = 0; Index < MatchSamples.Num(); ++Index)
+    {
+        MatchIndicesByU[Index] = Index;
+    }
+    MatchIndicesByU.Sort([&MatchSamples](int32 A, int32 B)
+    {
+        const double AU = MatchSamples[A].GridUV.X;
+        const double BU = MatchSamples[B].GridUV.X;
+        return AU == BU ? A < B : AU < BU;
+    });
+
+    const auto FindNearestUnusedMatchedUV =
+        [this, bSourceDrives, &MatchSamples, &UsedMatches, &MatchIndicesByU, MaxLinkDistanceSq](const FProjectedGridSample& DriverSample) -> int32
+    {
+        int32 Low = 0;
+        int32 High = MatchIndicesByU.Num();
+        while (Low < High)
+        {
+            const int32 Mid = Low + (High - Low) / 2;
+            if (MatchSamples[MatchIndicesByU[Mid]].GridUV.X < DriverSample.GridUV.X)
+            {
+                Low = Mid + 1;
+            }
+            else
+            {
+                High = Mid;
+            }
+        }
+
+        int32 Left = Low - 1;
+        int32 Right = Low;
+        int32 BestIndex = INDEX_NONE;
+        double BestDistanceSq = TNumericLimits<double>::Max();
+
+        while (Left >= 0 || Right < MatchIndicesByU.Num())
+        {
+            const double LeftDuSq = Left >= 0
+                ? FMath::Square(static_cast<double>(MatchSamples[MatchIndicesByU[Left]].GridUV.X - DriverSample.GridUV.X))
+                : TNumericLimits<double>::Max();
+            const double RightDuSq = Right < MatchIndicesByU.Num()
+                ? FMath::Square(static_cast<double>(MatchSamples[MatchIndicesByU[Right]].GridUV.X - DriverSample.GridUV.X))
+                : TNumericLimits<double>::Max();
+
+            if (BestIndex != INDEX_NONE && LeftDuSq > BestDistanceSq && RightDuSq > BestDistanceSq)
+            {
+                break;
+            }
+
+            const bool bTakeLeft = LeftDuSq < RightDuSq
+                || (LeftDuSq == RightDuSq
+                    && Left >= 0
+                    && (Right >= MatchIndicesByU.Num() || MatchIndicesByU[Left] < MatchIndicesByU[Right]));
+            const int32 SortedPosition = bTakeLeft ? Left-- : Right++;
+            const int32 CandidateIndex = MatchIndicesByU[SortedPosition];
+
+            if (UsedMatches[CandidateIndex])
+            {
+                continue;
+            }
+
+            const FVector SourceWorld = bSourceDrives ? DriverSample.ProjectedWorld : MatchSamples[CandidateIndex].ProjectedWorld;
+            const FVector TargetWorld = bSourceDrives ? MatchSamples[CandidateIndex].ProjectedWorld : DriverSample.ProjectedWorld;
+            if (!IsPairUsable(SourceWorld, TargetWorld, MaxLinkDistanceSq))
+            {
+                continue;
+            }
+
+            const double DistanceSq = (MatchSamples[CandidateIndex].GridUV - DriverSample.GridUV).SizeSquared();
+            if (DistanceSq < BestDistanceSq
+                || (DistanceSq == BestDistanceSq && (BestIndex == INDEX_NONE || CandidateIndex < BestIndex)))
+            {
+                BestDistanceSq = DistanceSq;
+                BestIndex = CandidateIndex;
+            }
+        }
+
+        return BestIndex;
+    };
+
     for (const FProjectedGridSample& DriverSample : DriverSamples)
     {
-        const int32 MatchIndex = FindNearestUnusedSampleByUV(DriverSample, bSourceDrives, MatchSamples, UsedMatches);
+        const int32 MatchIndex = FindNearestUnusedMatchedUV(DriverSample);
         if (MatchIndex == INDEX_NONE)
         {
             continue;
@@ -649,24 +939,21 @@ void AOmniVolumeNavLink::BuildMatchedGridPairs(const TArray<FProjectedGridSample
     }
 }
 
-bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks)
+bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, const FPairGenerationContext& Context, TArray<FNavigationLink>& InOutLinks, TArray<FOmniJumpLinkSpec>& InOutJumpLinks, TArray<FOmniMantleLinkSpec>& InOutMantleLinks, TArray<FOmniCustomLinkSpec>& InOutCustomLinks)
 {
     ++CandidateCount;
 
-    const int32 SafeMaximumLinks = FMath::Clamp(MaximumGeneratedLinks, 1, 1024);
+    const int32 SafeMaximumLinks = Context.SafeMaximumLinks;
     if (InOutLinks.Num() + InOutJumpLinks.Num() + InOutMantleLinks.Num() + InOutCustomLinks.Num() >= SafeMaximumLinks)
     {
         return false;
     }
 
-    if (MaximumLinkDistance > 0.0f)
+    if (Context.MaxLinkDistanceSq >= 0.0
+        && FVector::DistSquared(Pair.SourceWorld, Pair.TargetWorld) > Context.MaxLinkDistanceSq)
     {
-        const double MaxLinkDistanceSq = FMath::Square(static_cast<double>(MaximumLinkDistance));
-        if (FVector::DistSquared(Pair.SourceWorld, Pair.TargetWorld) > MaxLinkDistanceSq)
-        {
-            ++RejectedDistanceCount;
-            return false;
-        }
+        ++RejectedDistanceCount;
+        return false;
     }
 
     ENavLinkDirection::Type PairDirection = GetNativeDirection();
@@ -676,9 +963,8 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return false;
     }
 
-    const double MergeDistance = static_cast<double>(FMath::Max(0.0f, EndpointMergeDistance));
-    const double MergeDistanceSq = FMath::Square(MergeDistance);
-    const double MergeCellSize = FMath::Max(1.0, MergeDistance);
+    const double MergeDistanceSq = Context.MergeDistanceSq;
+    const double MergeCellSize = Context.MergeCellSize;
     const auto ToMergeCell = [MergeCellSize](const FVector& Location)
     {
         return FIntVector(
@@ -728,13 +1014,8 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         ++HeightRestrictedLinkCount;
     }
 
-    UClass* ResolvedAreaClass = AreaClass.Get();
-    if (!ResolvedAreaClass)
-    {
-        ResolvedAreaClass = UNavArea_Default::StaticClass();
-    }
-
-    const FTransform LinkTransform = GeneratedLinks->GetComponentTransform();
+    UClass* ResolvedAreaClass = Context.ResolvedAreaClass;
+    const FTransform& LinkTransform = Context.LinkTransform;
 
     auto EmitRawLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
     {
@@ -831,6 +1112,8 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         PreviewRejectedJumpPairs.Add(PreviewPair);
     };
 
+    const FOmniTraversalPlan* ActiveTraversalPlan = nullptr;
+
     auto ValidateJumpDirection = [&](ENavLinkDirection::Type Direction) -> bool
     {
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
@@ -839,7 +1122,34 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         bool bTooFast = false;
         FVector BlockingLocation = FVector::ZeroVector;
         FString BlockingObject;
-        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject))
+        bool bSkipDepartureSupport = false;
+        bool bSkipDepartureClearance = false;
+        if (ActiveTraversalPlan)
+        {
+            const FOmniAutomaticDirectionDiagnostic& Diagnostic = Direction == ENavLinkDirection::RightToLeft
+                ? ActiveTraversalPlan->TargetToSourceAutomatic
+                : ActiveTraversalPlan->SourceToTargetAutomatic;
+
+            if (Diagnostic.bEvaluated && Diagnostic.bMantleValidationFallback && Diagnostic.bMantleValidationPerformed)
+            {
+                switch (Diagnostic.MantleValidationResult)
+                {
+                case EOmniMantleValidationResult::DepartureClearance:
+                    bSkipDepartureSupport = true;
+                    break;
+                case EOmniMantleValidationResult::PathBlocked:
+                case EOmniMantleValidationResult::LandingSupport:
+                case EOmniMantleValidationResult::LandingClearance:
+                    bSkipDepartureSupport = true;
+                    bSkipDepartureClearance = true;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+
+        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject, bSkipDepartureSupport, bSkipDepartureClearance))
         {
             return true;
         }
@@ -889,7 +1199,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         return false;
     };
 
-    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
+    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom, bool bMantleAlreadyValidated) -> bool
     {
         if (bUseCustom)
         {
@@ -898,7 +1208,7 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
 
         if (bUseMantle)
         {
-            if (!bValidateMantlePath)
+            if (!bValidateMantlePath || bMantleAlreadyValidated)
             {
                 return EmitRawLink(Direction, false, true, false);
             }
@@ -998,6 +1308,8 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
         TargetToSourceTraversalAction,
         AutomaticSettings);
 
+    ActiveTraversalPlan = &TraversalPlan;
+
     if (UsesTraversalAction(EOmniTraversalAction::Automatic))
     {
         auto RecordAutomaticDiagnostic = [&](const FOmniAutomaticDirectionDiagnostic& Diagnostic, ENavLinkDirection::Type Direction)
@@ -1010,13 +1322,17 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
             if (Diagnostic.bMantleValidationFallback)
             {
                 ++AutomaticMantleValidationFallbackCount;
-                const FVector MantleStartWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.TargetWorld : Pair.SourceWorld;
-                const FVector MantleEndWorld = Direction == ENavLinkDirection::RightToLeft ? Pair.SourceWorld : Pair.TargetWorld;
                 int32 FailureCode = 0;
-                FVector BlockingLocation = FVector::ZeroVector;
-                FString BlockingObject;
-                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode, &BlockingLocation, &BlockingObject);
-                RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
+                switch (Diagnostic.MantleValidationResult)
+                {
+                case EOmniMantleValidationResult::DepartureSupport: FailureCode = 1; break;
+                case EOmniMantleValidationResult::DepartureClearance: FailureCode = 2; break;
+                case EOmniMantleValidationResult::PathBlocked: FailureCode = 3; break;
+                case EOmniMantleValidationResult::LandingSupport: FailureCode = 4; break;
+                case EOmniMantleValidationResult::LandingClearance: FailureCode = 5; break;
+                default: FailureCode = 0; break;
+                }
+                RecordRejectedMantle(Direction, FailureCode, Diagnostic.MantleBlockingLocation, Diagnostic.MantleBlockingObject);
             }
 
             if (Diagnostic.bMantleLedgeFallback)
@@ -1060,7 +1376,33 @@ bool AOmniVolumeNavLink::AddProjectedPair(const FProjectedPair& Pair, TArray<FNa
     for (int32 LegIndex = 0; LegIndex < TraversalPlan.LegCount; ++LegIndex)
     {
         const FOmniTraversalLeg& Leg = TraversalPlan.Legs[LegIndex];
-        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom);
+        auto HasValidatedAutomaticMantle = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
+        {
+            return Diagnostic.bEvaluated
+                && Diagnostic.bUseMantle
+                && Diagnostic.bMantleValidationPerformed
+                && Diagnostic.MantleValidationResult == EOmniMantleValidationResult::Valid;
+        };
+
+        bool bMantleAlreadyValidated = false;
+        if (Leg.bUseMantle)
+        {
+            if (Leg.Direction == ENavLinkDirection::LeftToRight)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.SourceToTargetAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::RightToLeft)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.TargetToSourceAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::BothWays)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.SourceToTargetAutomatic)
+                    && HasValidatedAutomaticMantle(TraversalPlan.TargetToSourceAutomatic);
+            }
+        }
+
+        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom, bMantleAlreadyValidated);
         if (bAdded && UsesTraversalAction(EOmniTraversalAction::Automatic) && PreviewGeneratedPairs.Num() > 0)
         {
             auto IsMantleFallback = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
@@ -1196,11 +1538,17 @@ int32 AOmniVolumeNavLink::FindNearestUnusedSampleByUV(const FProjectedGridSample
     return BestIndex;
 }
 
-bool AOmniVolumeNavLink::IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld) const
+bool AOmniVolumeNavLink::IsPairUsable(const FVector& SourceWorld, const FVector& TargetWorld, double MaxLinkDistanceSq) const
 {
-    if (MaximumLinkDistance > 0.0f)
+    if (MaxLinkDistanceSq < -1.0)
     {
-        const double MaxLinkDistanceSq = FMath::Square(static_cast<double>(MaximumLinkDistance));
+        MaxLinkDistanceSq = MaximumLinkDistance > 0.0f
+            ? FMath::Square(static_cast<double>(MaximumLinkDistance))
+            : -1.0;
+    }
+
+    if (MaxLinkDistanceSq >= 0.0)
+    {
         if (FVector::DistSquared(SourceWorld, TargetWorld) > MaxLinkDistanceSq)
         {
             return false;
@@ -1275,7 +1623,7 @@ bool AOmniVolumeNavLink::ResolvePairDirection(const FVector& SourceWorld, const 
 }
 
 
-bool AOmniVolumeNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject) const
+bool AOmniVolumeNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject, bool bSkipDepartureSupport, bool bSkipDepartureClearance) const
 {
     OutFailureCode = 0;
     bOutTooFast = false;
@@ -1287,6 +1635,8 @@ bool AOmniVolumeNavLink::IsJumpDirectionValid(const FVector& StartWorld, const F
     Settings.AgentHalfHeight = JumpValidationAgentHalfHeight;
     Settings.MaxHorizontalSpeed = MaximumJumpHorizontalSpeed;
     Settings.ArcSegments = JumpValidationSegments;
+    Settings.bSkipDepartureSupport = bSkipDepartureSupport;
+    Settings.bSkipDepartureClearance = bSkipDepartureClearance;
 
     const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniJumpValidationResult::Valid)
@@ -1845,6 +2195,16 @@ void AOmniVolumeNavLink::DrawEditorPreview() const
 }
 #endif
 
+bool AOmniVolumeNavLink::CanRegenerateNow() const
+{
+    if (IsTemplate() || IsActorBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+    {
+        return false;
+    }
+
+    return GetWorld() != nullptr;
+}
+
 void AOmniVolumeNavLink::NotifyNavigationSystem()
 {
     if (!GeneratedLinks || !GeneratedLinks->IsRegistered() || !GeneratedLinks->GetWorld())
@@ -1857,7 +2217,7 @@ void AOmniVolumeNavLink::NotifyNavigationSystem()
 
 void AOmniVolumeNavLink::BindNavigationGenerationDelegate()
 {
-    if (!bRegenerateAfterNavigationBuild || !GetWorld())
+    if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild)
     {
         return;
     }
@@ -1883,7 +2243,7 @@ void AOmniVolumeNavLink::UnbindNavigationGenerationDelegate()
 
 void AOmniVolumeNavLink::HandleNavigationGenerationFinished(ANavigationData* NavData)
 {
-    if (!bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
+    if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
     {
         return;
     }
@@ -1894,7 +2254,10 @@ void AOmniVolumeNavLink::HandleNavigationGenerationFinished(ANavigationData* Nav
 #if WITH_EDITOR
 void AOmniVolumeNavLink::QueueEditorRegeneration()
 {
-    bEditorRegenerationPending = true;
+    if (CanRegenerateNow())
+    {
+        bEditorRegenerationPending = true;
+    }
 }
 
 void AOmniVolumeNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)

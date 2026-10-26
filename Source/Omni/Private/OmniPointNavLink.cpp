@@ -106,8 +106,63 @@ void AOmniPointNavLink::PostRegisterAllComponents()
 
 void AOmniPointNavLink::PostUnregisterAllComponents()
 {
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
     UnbindNavigationGenerationDelegate();
     Super::PostUnregisterAllComponents();
+}
+
+void AOmniPointNavLink::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+    UnbindNavigationGenerationDelegate();
+
+    // EndPlay covers PIE stop, level transitions, streamed-level removal, and
+    // runtime destruction. Release paused path following before the generated
+    // smart-link components leave the world.
+    if (JumpTraversal)
+    {
+        JumpTraversal->ClearLinks();
+    }
+    if (MantleTraversal)
+    {
+        MantleTraversal->ClearLinks();
+    }
+    if (CustomTraversal)
+    {
+        CustomTraversal->ClearLinks();
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
+void AOmniPointNavLink::Destroyed()
+{
+#if WITH_EDITOR
+    bEditorRegenerationPending = false;
+#endif
+    UnbindNavigationGenerationDelegate();
+
+    // Release any AI currently paused on an Omni smart link before the actor's
+    // components are torn down. This keeps deletion, PIE shutdown, and level
+    // teardown from leaving path following waiting on a link that no longer exists.
+    if (JumpTraversal)
+    {
+        JumpTraversal->ClearLinks();
+    }
+    if (MantleTraversal)
+    {
+        MantleTraversal->ClearLinks();
+    }
+    if (CustomTraversal)
+    {
+        CustomTraversal->ClearLinks();
+    }
+
+    Super::Destroyed();
 }
 
 void AOmniPointNavLink::Tick(float DeltaSeconds)
@@ -117,7 +172,7 @@ void AOmniPointNavLink::Tick(float DeltaSeconds)
     if (bEditorRegenerationPending)
     {
         bEditorRegenerationPending = false;
-        if (bAutoRegenerate)
+        if (bAutoRegenerate && CanRegenerateNow())
         {
             RegenerateLink();
         }
@@ -213,7 +268,7 @@ void AOmniPointNavLink::RecheckDiagnostics()
 
 void AOmniPointNavLink::RegenerateLink()
 {
-    if (bIsRegenerating || !GeneratedLinks || !SourcePoint || !TargetPoint)
+    if (bIsRegenerating || !CanRegenerateNow() || !GeneratedLinks || !SourcePoint || !TargetPoint)
     {
         return;
     }
@@ -533,6 +588,8 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         Preview.BlockingObject = BlockingObject;
     };
 
+    const FOmniTraversalPlan* ActiveTraversalPlan = nullptr;
+
     auto ValidateJumpDirection = [&](ENavLinkDirection::Type Direction) -> bool
     {
         const FVector StartWorld = Direction == ENavLinkDirection::RightToLeft ? TargetWorld : SourceWorld;
@@ -541,7 +598,34 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         bool bTooFast = false;
         FVector BlockingLocation = FVector::ZeroVector;
         FString BlockingObject;
-        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject))
+        bool bSkipDepartureSupport = false;
+        bool bSkipDepartureClearance = false;
+        if (ActiveTraversalPlan)
+        {
+            const FOmniAutomaticDirectionDiagnostic& Diagnostic = Direction == ENavLinkDirection::RightToLeft
+                ? ActiveTraversalPlan->TargetToSourceAutomatic
+                : ActiveTraversalPlan->SourceToTargetAutomatic;
+
+            if (Diagnostic.bEvaluated && Diagnostic.bMantleValidationFallback && Diagnostic.bMantleValidationPerformed)
+            {
+                switch (Diagnostic.MantleValidationResult)
+                {
+                case EOmniMantleValidationResult::DepartureClearance:
+                    bSkipDepartureSupport = true;
+                    break;
+                case EOmniMantleValidationResult::PathBlocked:
+                case EOmniMantleValidationResult::LandingSupport:
+                case EOmniMantleValidationResult::LandingClearance:
+                    bSkipDepartureSupport = true;
+                    bSkipDepartureClearance = true;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+
+        if (IsJumpDirectionValid(StartWorld, EndWorld, FailureCode, bTooFast, &BlockingLocation, &BlockingObject, bSkipDepartureSupport, bSkipDepartureClearance))
         {
             return true;
         }
@@ -592,7 +676,7 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         return false;
     };
 
-    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom) -> bool
+    auto EmitLink = [&](ENavLinkDirection::Type Direction, bool bUseJump, bool bUseMantle, bool bUseCustom, bool bMantleAlreadyValidated) -> bool
     {
         if (bUseCustom)
         {
@@ -601,7 +685,7 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
 
         if (bUseMantle)
         {
-            if (!bValidateMantlePath)
+            if (!bValidateMantlePath || bMantleAlreadyValidated)
             {
                 return EmitRawLink(Direction, false, true, false);
             }
@@ -701,6 +785,8 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
         TargetToSourceTraversalAction,
         AutomaticSettings);
 
+    ActiveTraversalPlan = &TraversalPlan;
+
     if (UsesTraversalAction(EOmniTraversalAction::Automatic))
     {
         auto RecordAutomaticDiagnostic = [&](const FOmniAutomaticDirectionDiagnostic& Diagnostic, ENavLinkDirection::Type Direction)
@@ -713,13 +799,17 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
             if (Diagnostic.bMantleValidationFallback)
             {
                 ++AutomaticMantleValidationFallbackCount;
-                const FVector MantleStartWorld = Direction == ENavLinkDirection::RightToLeft ? TargetWorld : SourceWorld;
-                const FVector MantleEndWorld = Direction == ENavLinkDirection::RightToLeft ? SourceWorld : TargetWorld;
                 int32 FailureCode = 0;
-                FVector BlockingLocation = FVector::ZeroVector;
-                FString BlockingObject;
-                IsMantleDirectionValid(MantleStartWorld, MantleEndWorld, FailureCode, &BlockingLocation, &BlockingObject);
-                RecordRejectedMantle(Direction, FailureCode, BlockingLocation, BlockingObject);
+                switch (Diagnostic.MantleValidationResult)
+                {
+                case EOmniMantleValidationResult::DepartureSupport: FailureCode = 1; break;
+                case EOmniMantleValidationResult::DepartureClearance: FailureCode = 2; break;
+                case EOmniMantleValidationResult::PathBlocked: FailureCode = 3; break;
+                case EOmniMantleValidationResult::LandingSupport: FailureCode = 4; break;
+                case EOmniMantleValidationResult::LandingClearance: FailureCode = 5; break;
+                default: FailureCode = 0; break;
+                }
+                RecordRejectedMantle(Direction, FailureCode, Diagnostic.MantleBlockingLocation, Diagnostic.MantleBlockingObject);
             }
 
             if (Diagnostic.bMantleLedgeFallback)
@@ -763,7 +853,33 @@ bool AOmniPointNavLink::GenerateProjectedConnection(const FVector& SourceWorld, 
     for (int32 LegIndex = 0; LegIndex < TraversalPlan.LegCount; ++LegIndex)
     {
         const FOmniTraversalLeg& Leg = TraversalPlan.Legs[LegIndex];
-        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom);
+        auto HasValidatedAutomaticMantle = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
+        {
+            return Diagnostic.bEvaluated
+                && Diagnostic.bUseMantle
+                && Diagnostic.bMantleValidationPerformed
+                && Diagnostic.MantleValidationResult == EOmniMantleValidationResult::Valid;
+        };
+
+        bool bMantleAlreadyValidated = false;
+        if (Leg.bUseMantle)
+        {
+            if (Leg.Direction == ENavLinkDirection::LeftToRight)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.SourceToTargetAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::RightToLeft)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.TargetToSourceAutomatic);
+            }
+            else if (Leg.Direction == ENavLinkDirection::BothWays)
+            {
+                bMantleAlreadyValidated = HasValidatedAutomaticMantle(TraversalPlan.SourceToTargetAutomatic)
+                    && HasValidatedAutomaticMantle(TraversalPlan.TargetToSourceAutomatic);
+            }
+        }
+
+        const bool bAdded = EmitLink(Leg.Direction, Leg.bUseJump, Leg.bUseMantle, Leg.bUseCustom, bMantleAlreadyValidated);
         if (bAdded && UsesTraversalAction(EOmniTraversalAction::Automatic) && PreviewGeneratedLinks.Num() > 0)
         {
             auto IsMantleFallback = [](const FOmniAutomaticDirectionDiagnostic& Diagnostic)
@@ -864,7 +980,7 @@ bool AOmniPointNavLink::ResolvePairDirection(const FVector& SourceWorld, const F
     }
 }
 
-bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject) const
+bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FVector& EndWorld, int32& OutFailureCode, bool& bOutTooFast, FVector* OutBlockingLocation, FString* OutBlockingObject, bool bSkipDepartureSupport, bool bSkipDepartureClearance) const
 {
     OutFailureCode = 0;
     bOutTooFast = false;
@@ -876,6 +992,8 @@ bool AOmniPointNavLink::IsJumpDirectionValid(const FVector& StartWorld, const FV
     Settings.AgentHalfHeight = TraversalAgentHalfHeight;
     Settings.MaxHorizontalSpeed = MaximumJumpHorizontalSpeed;
     Settings.ArcSegments = JumpValidationSegments;
+    Settings.bSkipDepartureSupport = bSkipDepartureSupport;
+    Settings.bSkipDepartureClearance = bSkipDepartureClearance;
 
     const EOmniJumpValidationResult Result = OmniTraversal::ValidateJumpPath(GetWorld(), this, StartWorld, EndWorld, Settings, OutBlockingLocation, OutBlockingObject);
     if (Result == EOmniJumpValidationResult::Valid)
@@ -1419,6 +1537,16 @@ void AOmniPointNavLink::DrawEditorPreview() const
 }
 #endif
 
+bool AOmniPointNavLink::CanRegenerateNow() const
+{
+    if (IsTemplate() || IsActorBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+    {
+        return false;
+    }
+
+    return GetWorld() != nullptr;
+}
+
 void AOmniPointNavLink::NotifyNavigationSystem()
 {
     if (!GeneratedLinks || !GeneratedLinks->IsRegistered() || !GeneratedLinks->GetWorld())
@@ -1431,7 +1559,7 @@ void AOmniPointNavLink::NotifyNavigationSystem()
 
 void AOmniPointNavLink::BindNavigationGenerationDelegate()
 {
-    if (!bRegenerateAfterNavigationBuild || !GetWorld())
+    if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild)
     {
         return;
     }
@@ -1457,7 +1585,7 @@ void AOmniPointNavLink::UnbindNavigationGenerationDelegate()
 
 void AOmniPointNavLink::HandleNavigationGenerationFinished(ANavigationData* NavData)
 {
-    if (!bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
+    if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
     {
         return;
     }
@@ -1468,7 +1596,10 @@ void AOmniPointNavLink::HandleNavigationGenerationFinished(ANavigationData* NavD
 #if WITH_EDITOR
 void AOmniPointNavLink::QueueEditorRegeneration()
 {
-    bEditorRegenerationPending = true;
+    if (CanRegenerateNow())
+    {
+        bEditorRegenerationPending = true;
+    }
 }
 
 void AOmniPointNavLink::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
