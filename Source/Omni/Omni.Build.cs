@@ -25,7 +25,15 @@ public class Omni : ModuleRules
 
         if (Target.bBuildEditor)
         {
-            PrivateDependencyModuleNames.Add("UnrealEd");
+            PrivateDependencyModuleNames.AddRange(
+                new string[]
+                {
+                    "UnrealEd",
+                    "ToolMenus",
+                    "Slate",
+                    "SlateCore"
+                }
+            );
         }
     }
 }

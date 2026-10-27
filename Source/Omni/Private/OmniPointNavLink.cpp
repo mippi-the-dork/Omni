@@ -15,6 +15,7 @@
 #include "Components/SceneComponent.h"
 #include "Components/SphereComponent.h"
 #include "NavAreas/NavArea_Default.h"
+#include "NavAreas/NavArea_Null.h"
 #include "NavigationData.h"
 #include "NavigationSystem.h"
 #include "NavLinkComponent.h"
@@ -74,6 +75,7 @@ AOmniPointNavLink::AOmniPointNavLink()
     AreaClass = UNavArea_Default::StaticClass();
     JumpAreaClass = UOmniNavArea_Jump::StaticClass();
     MantleAreaClass = UOmniNavArea_Mantle::StaticClass();
+    CustomDisabledAreaClass = UNavArea_Null::StaticClass();
     SupportedAgents = FNavAgentSelector(FNavAgentSelector::AllAgentsMask);
     GenerationStatus = FText::FromString(TEXT("Place Source Point and Target Point over navigable regions."));
 }
@@ -95,6 +97,21 @@ void AOmniPointNavLink::OnConstruction(const FTransform& Transform)
             RegenerateLink();
         }
     }
+}
+
+void AOmniPointNavLink::PreRegisterAllComponents()
+{
+    // GeneratedLinks->Links is derived output, not authored state. A serialized,
+    // duplicated, or reconstructed default subobject can still contain the previous
+    // generated array before component registration. Clear it before navigation can
+    // observe stale links; PostRegisterAllComponents regenerates the authoritative
+    // array from the actor's current authored properties.
+    if (GeneratedLinks)
+    {
+        GeneratedLinks->Links.Reset();
+    }
+
+    Super::PreRegisterAllComponents();
 }
 
 void AOmniPointNavLink::PostRegisterAllComponents()
@@ -346,7 +363,7 @@ void AOmniPointNavLink::RegenerateLink()
     {
         if (bEnabled && !NewCustomLinks.IsEmpty())
         {
-            CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, CustomTraversalTimeout);
+            CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, CustomDisabledAreaClass, bCustomLinkEnabled, CustomTraversalTimeout);
         }
         else
         {

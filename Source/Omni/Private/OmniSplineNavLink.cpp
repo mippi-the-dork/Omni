@@ -153,6 +153,21 @@ void AOmniSplineNavLink::OnConstruction(const FTransform& Transform)
     }
 }
 
+void AOmniSplineNavLink::PreRegisterAllComponents()
+{
+    // GeneratedLinks->Links is derived output, not authored state. A serialized,
+    // duplicated, or reconstructed default subobject can still contain the previous
+    // generated array before component registration. Clear it before navigation can
+    // observe stale links; PostRegisterAllComponents regenerates the authoritative
+    // array from the actor's current authored properties.
+    if (GeneratedLinks)
+    {
+        GeneratedLinks->Links.Reset();
+    }
+
+    Super::PreRegisterAllComponents();
+}
+
 void AOmniSplineNavLink::PostRegisterAllComponents()
 {
     Super::PostRegisterAllComponents();
@@ -491,7 +506,7 @@ void AOmniSplineNavLink::RegenerateLinks()
     {
         if (bEnabled && !NewCustomLinks.IsEmpty())
         {
-            CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, CustomTraversalTimeout);
+            CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, nullptr, true, CustomTraversalTimeout);
         }
         else
         {

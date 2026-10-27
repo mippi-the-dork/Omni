@@ -43,6 +43,7 @@ public:
     AOmniPointNavLink();
 
     virtual void OnConstruction(const FTransform& Transform) override;
+    virtual void PreRegisterAllComponents() override;
     virtual void PostRegisterAllComponents() override;
     virtual void PostUnregisterAllComponents() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -172,6 +173,14 @@ public:
     /** Safety timeout for designer-driven Custom traversal requests. If it expires, Omni resumes path following to avoid a permanent stall. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Traversal Timeout", ClampMin="0.25", UIMin="0.5", UIMax="30.0", Units="s", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Custom) || (bUseDirectionalTraversalActions && ((LinkDirection != EOmniPointLinkDirection::TargetToSource && SourceToTargetTraversalAction == EOmniTraversalAction::Custom) || (LinkDirection != EOmniPointLinkDirection::SourceToTarget && TargetToSourceTraversalAction == EOmniTraversalAction::Custom))))", EditConditionHides, DisplayPriority="9"))
     float CustomTraversalTimeout = 5.0f;
+
+    /** Runtime enabled state for generated Custom smart links. Preserved when migrating a native NavLinkProxy Smart Link. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Link Enabled", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Custom) || (bUseDirectionalTraversalActions && ((LinkDirection != EOmniPointLinkDirection::TargetToSource && SourceToTargetTraversalAction == EOmniTraversalAction::Custom) || (LinkDirection != EOmniPointLinkDirection::SourceToTarget && TargetToSourceTraversalAction == EOmniTraversalAction::Custom))))", EditConditionHides, AdvancedDisplay))
+    bool bCustomLinkEnabled = true;
+
+    /** Nav Area used by generated Custom smart links while disabled. Native Smart Link migration copies the source disabled area here. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Disabled Area Class", EditCondition="((!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Custom) || (bUseDirectionalTraversalActions && ((LinkDirection != EOmniPointLinkDirection::TargetToSource && SourceToTargetTraversalAction == EOmniTraversalAction::Custom) || (LinkDirection != EOmniPointLinkDirection::SourceToTarget && TargetToSourceTraversalAction == EOmniTraversalAction::Custom))))", EditConditionHides, AdvancedDisplay))
+    TSubclassOf<UNavAreaBase> CustomDisabledAreaClass;
 
     /** Identifier included with non-directional Custom traversal requests so project logic can route the request without inspecting geometry. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Omni|Traversal", meta=(DisplayName="Custom Traversal ID", EditCondition="!bUseDirectionalTraversalActions && TraversalAction == EOmniTraversalAction::Custom", EditConditionHides, DisplayPriority="10"))

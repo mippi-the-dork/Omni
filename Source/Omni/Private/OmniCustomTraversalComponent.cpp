@@ -4,6 +4,7 @@
 #include "GameFramework/Pawn.h"
 #include "NavAreas/NavArea.h"
 #include "NavAreas/NavArea_Default.h"
+#include "NavAreas/NavArea_Null.h"
 #include "NavLinkCustomComponent.h"
 #include "Navigation/PathFollowingComponent.h"
 
@@ -17,6 +18,8 @@ void UOmniCustomTraversalComponent::RebuildLinks(
     const TArray<FOmniCustomLinkSpec>& LinkSpecs,
     const FNavAgentSelector& InSupportedAgents,
     TSubclassOf<UNavAreaBase> AreaClass,
+    TSubclassOf<UNavAreaBase> DisabledAreaClass,
+    bool bLinksEnabled,
     float InTraversalTimeout)
 {
     AActor* Owner = GetOwner();
@@ -40,7 +43,7 @@ void UOmniCustomTraversalComponent::RebuildLinks(
         }
     }
 
-    if (IsConfigurationEquivalent(LinkSpecs, InSupportedAgents, AreaClass, InTraversalTimeout))
+    if (IsConfigurationEquivalent(LinkSpecs, InSupportedAgents, AreaClass, DisabledAreaClass, bLinksEnabled, InTraversalTimeout))
     {
         return;
     }
@@ -91,6 +94,15 @@ void UOmniCustomTraversalComponent::RebuildLinks(
         }
     }
 
+    TSubclassOf<UNavArea> ResolvedDisabledAreaClass = UNavArea_Null::StaticClass();
+    if (UClass* RequestedDisabledAreaClass = DisabledAreaClass.Get())
+    {
+        if (RequestedDisabledAreaClass->IsChildOf(UNavArea::StaticClass()))
+        {
+            ResolvedDisabledAreaClass = RequestedDisabledAreaClass;
+        }
+    }
+
     const FTransform OwnerTransform = Owner->GetActorTransform();
     const int32 LinkCount = FMath::Min(CustomLinks.Num(), LinkSpecs.Num());
     for (int32 Index = 0; Index < LinkCount; ++Index)
@@ -107,8 +119,9 @@ void UOmniCustomTraversalComponent::RebuildLinks(
 
         Link->SetSupportedAgents(InSupportedAgents);
         Link->SetEnabledArea(ResolvedAreaClass);
+        Link->SetDisabledArea(ResolvedDisabledAreaClass);
         Link->SetLinkData(RelativeStart, RelativeEnd, Spec.Direction);
-        Link->SetEnabled(true);
+        Link->SetEnabled(bLinksEnabled);
 
         if (!Link->IsRegistered() && Owner->GetWorld())
         {
@@ -124,7 +137,21 @@ void UOmniCustomTraversalComponent::RebuildLinks(
     CachedLinkSpecs = LinkSpecs;
     CachedSupportedAgents = InSupportedAgents;
     CachedAreaClass = AreaClass.Get();
+    CachedDisabledAreaClass = DisabledAreaClass.Get();
+    bCachedLinksEnabled = bLinksEnabled;
     bHasCachedConfiguration = true;
+}
+
+void UOmniCustomTraversalComponent::SetLinksEnabled(bool bEnabled)
+{
+    bCachedLinksEnabled = bEnabled;
+    for (UNavLinkCustomComponent* Link : CustomLinks)
+    {
+        if (IsValid(Link))
+        {
+            Link->SetEnabled(bEnabled);
+        }
+    }
 }
 
 void UOmniCustomTraversalComponent::ClearLinks()
@@ -149,6 +176,8 @@ void UOmniCustomTraversalComponent::ClearLinks()
     CustomLinks.Reset();
     CachedLinkSpecs.Reset();
     CachedAreaClass.Reset();
+    CachedDisabledAreaClass.Reset();
+    bCachedLinksEnabled = true;
     bHasCachedConfiguration = false;
     SetComponentTickEnabled(false);
 }
@@ -391,6 +420,8 @@ bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
     const TArray<FOmniCustomLinkSpec>& LinkSpecs,
     const FNavAgentSelector& InSupportedAgents,
     TSubclassOf<UNavAreaBase> AreaClass,
+    TSubclassOf<UNavAreaBase> DisabledAreaClass,
+    bool bLinksEnabled,
     float InTraversalTimeout) const
 {
     if (!bHasCachedConfiguration
@@ -398,6 +429,8 @@ bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
         || CustomLinks.Num() != LinkSpecs.Num()
         || !CachedSupportedAgents.IsSame(InSupportedAgents)
         || CachedAreaClass.Get() != AreaClass.Get()
+        || CachedDisabledAreaClass.Get() != DisabledAreaClass.Get()
+        || bCachedLinksEnabled != bLinksEnabled
         || !FMath::IsNearlyEqual(TraversalTimeout, FMath::Max(0.25f, InTraversalTimeout)))
     {
         return false;

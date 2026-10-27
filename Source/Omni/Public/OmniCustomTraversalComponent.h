@@ -78,11 +78,21 @@ public:
     UFUNCTION(BlueprintCallable, Category="Omni|Custom Traversal", meta=(DisplayName="Get Custom Traversal Request"))
     bool GetTraversalRequest(int32 RequestId, FOmniCustomTraversalRequest& OutRequest) const;
 
+    /** Toggle the generated Custom smart links between their enabled and disabled Nav Area states without rebuilding navigation. */
+    UFUNCTION(BlueprintCallable, Category="Omni|Custom Traversal", meta=(DisplayName="Set Custom Links Enabled"))
+    void SetLinksEnabled(bool bEnabled);
+
+    /** Current enabled state shared by the generated Custom smart links. */
+    UFUNCTION(BlueprintPure, Category="Omni|Custom Traversal", meta=(DisplayName="Are Custom Links Enabled"))
+    bool AreLinksEnabled() const { return bCachedLinksEnabled; }
+
     /** Synchronize generated Custom smart links with the authoring actor. */
     void RebuildLinks(
         const TArray<FOmniCustomLinkSpec>& LinkSpecs,
         const FNavAgentSelector& SupportedAgents,
         TSubclassOf<UNavAreaBase> AreaClass,
+        TSubclassOf<UNavAreaBase> DisabledAreaClass,
+        bool bLinksEnabled,
         float InTraversalTimeout);
 
     /** Remove all generated Custom smart links and cancel active requests. */
@@ -104,7 +114,7 @@ private:
     void FinishTraversalAtIndex(int32 Index, EOmniCustomTraversalFinishReason Reason);
     void FinishTraversalsForLink(UNavLinkCustomComponent* LinkComp, EOmniCustomTraversalFinishReason Reason);
     int32 FindLinkIndex(const UNavLinkCustomComponent* LinkComp) const;
-    bool IsConfigurationEquivalent(const TArray<FOmniCustomLinkSpec>& LinkSpecs, const FNavAgentSelector& SupportedAgents, TSubclassOf<UNavAreaBase> AreaClass, float InTraversalTimeout) const;
+    bool IsConfigurationEquivalent(const TArray<FOmniCustomLinkSpec>& LinkSpecs, const FNavAgentSelector& SupportedAgents, TSubclassOf<UNavAreaBase> AreaClass, TSubclassOf<UNavAreaBase> DisabledAreaClass, bool bLinksEnabled, float InTraversalTimeout) const;
 
     UPROPERTY(Transient)
     TArray<TObjectPtr<UNavLinkCustomComponent>> CustomLinks;
@@ -117,5 +127,7 @@ private:
     TArray<FOmniCustomLinkSpec> CachedLinkSpecs;
     FNavAgentSelector CachedSupportedAgents;
     TWeakObjectPtr<UClass> CachedAreaClass;
+    TWeakObjectPtr<UClass> CachedDisabledAreaClass;
+    bool bCachedLinksEnabled = true;
     bool bHasCachedConfiguration = false;
 };

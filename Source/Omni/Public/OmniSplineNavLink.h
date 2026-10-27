@@ -44,6 +44,7 @@ public:
     AOmniSplineNavLink();
 
     virtual void OnConstruction(const FTransform& Transform) override;
+    virtual void PreRegisterAllComponents() override;
     virtual void PostRegisterAllComponents() override;
     virtual void PostUnregisterAllComponents() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;

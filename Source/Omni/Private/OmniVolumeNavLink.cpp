@@ -97,6 +97,21 @@ void AOmniVolumeNavLink::OnConstruction(const FTransform& Transform)
     }
 }
 
+void AOmniVolumeNavLink::PreRegisterAllComponents()
+{
+    // GeneratedLinks->Links is derived output, not authored state. A serialized,
+    // duplicated, or reconstructed default subobject can still contain the previous
+    // generated array before component registration. Clear it before navigation can
+    // observe stale links; PostRegisterAllComponents regenerates the authoritative
+    // array from the actor's current authored properties.
+    if (GeneratedLinks)
+    {
+        GeneratedLinks->Links.Reset();
+    }
+
+    Super::PreRegisterAllComponents();
+}
+
 void AOmniVolumeNavLink::PostRegisterAllComponents()
 {
     Super::PostRegisterAllComponents();
@@ -419,7 +434,7 @@ void AOmniVolumeNavLink::RegenerateLinks()
     {
         if (bEnabled && !NewCustomLinks.IsEmpty())
         {
-            CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, CustomTraversalTimeout);
+            CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, nullptr, true, CustomTraversalTimeout);
         }
         else
         {

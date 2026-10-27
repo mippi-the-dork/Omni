@@ -4,17 +4,17 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.56.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.60.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build continues the **1.0 robustness and integration hardening phase**. Version 0.56 hardens the generated smart-link cache used by Jump, Mantle, and Custom traversal. Cached link specs are now considered reusable only when the transient `UNavLinkCustomComponent` instances are also valid, still owned by the correct Omni actor, and registered when that actor is in a world.
+This development build completes the first-pass native Unreal NavLink migration coverage by adding **NavLinkProxy Segment Link migration**. Select one or more `NavLinkProxy` actors with SegmentLinks, then use **Omni > Convert NavLinkProxy Segment Links to Omni** from the Level Editor actor context menu. Omni creates one non-destructive `OmniSplineNavLink` for each native SegmentLink and leaves the source NavLinkProxy untouched.
 
-This matters during editor reconstruction, Undo/Redo, component unregister/register cycles, PIE transitions, and other lifecycle events where authored traversal specs can remain unchanged while transient generated components are recreated or temporarily unregistered. If Omni detects an invalid or foreign cached smart-link component, it safely discards the stale cache and rebuilds the generated links from the existing authored settings. Unregistered but otherwise healthy links are re-registered through the normal rebuild path rather than being incorrectly skipped by the equal-configuration fast path.
+The native LeftStart/LeftEnd segment becomes the Omni Source Spline and RightStart/RightEnd becomes the Target Spline. Both are authored as straight linear splines. The converted actor uses **Matched Grid** pairing, **Native Movement**, the source direction, Nav Area, Supported Agents, Snap Radius, and native projection-height intent. Max Crossing Distance is disabled so an existing wide crossing is not rejected by Omni's normal authoring default.
 
-The 0.55 lifecycle guards remain intact: deferred editor regeneration is cancelled during teardown, navigation-build callbacks refuse to regenerate invalid actors, and Jump/Mantle/Custom traversal is released from `EndPlay()` and `Destroyed()`. Normal authoring, traversal classification, generated endpoints, diagnostics, and serialized settings are unchanged.
+A native `FNavigationSegmentLink` is continuous, while Omni Spline publishes sampled native point links. Segment migration therefore preserves the authored two-segment relationship behaviorally rather than retaining one literal `FNavigationSegmentLink`. The converter uses the source Snap Radius as its preferred custom sample spacing, raises the converted actor's sample/link caps as needed within Omni's normal limits, and logs an explicit warning if the 1024 generated-link cap can affect a very large segment. The original NavLinkProxy remains available for validation and comparison.
 
-The dense-generation optimization work from 0.39 through 0.54 also remains intact. **Last Generation Time** is still available under Omni Status, but current development is focused on release hardening rather than speculative micro-optimization.
+The existing **Convert NavLinkProxy Point Links to Omni** and **Convert NavLinkProxy Smart Links to Omni** workflows remain available. Point, Segment, and Smart Link authoring now all have non-destructive Omni migration paths. Settings that Omni cannot currently represent exactly, including native Snap Height, Snap to Cheapest Area, custom link flags, and asymmetric projection heights, are reported rather than silently discarded.
 
-See `Doc/Smart-Link-Cache-Recovery-Test-Plan.md` for the 0.56 regression pass and `Doc/Lifecycle-Regeneration-Hardening-Test-Plan.md` for the 0.55 teardown/regeneration pass. The current 1.0 release bar is tracked in `Doc/1.0-Release-Requirements.md`.
+See `Doc/NavLinkProxy-Segment-Migration-Test-Plan.md`, `Doc/NavLinkProxy-Smart-Link-Migration-Test-Plan.md`, and `Doc/NavLinkProxy-Point-Migration-Test-Plan.md` for focused migration regression passes. The current 1.0 release bar is tracked in `Doc/1.0-Release-Requirements.md`.
 
 ### Built-in Mantle Traversal
 
