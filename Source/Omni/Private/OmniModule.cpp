@@ -799,12 +799,20 @@ void FOmniModule::ConvertSelectedSmartLinks()
         OmniActor->bUseDirectionalTraversalActions = false;
         OmniActor->MaximumLinkDistance = 0.0f;
         OmniActor->SupportedAgents = SmartLink->GetSupportedAgents();
-        OmniActor->AreaClass = SmartLink->GetEnabledArea()
-            ? SmartLink->GetEnabledArea()
-            : UNavArea_Default::StaticClass();
-        OmniActor->CustomDisabledAreaClass = SmartLink->GetDisabledArea()
-            ? SmartLink->GetDisabledArea()
-            : UNavArea_Null::StaticClass();
+
+        TSubclassOf<UNavArea> EnabledArea = SmartLink->GetEnabledArea();
+        if (!EnabledArea)
+        {
+            EnabledArea = UNavArea_Default::StaticClass();
+        }
+        OmniActor->AreaClass = EnabledArea;
+
+        TSubclassOf<UNavArea> DisabledArea = SmartLink->GetDisabledArea();
+        if (!DisabledArea)
+        {
+            DisabledArea = UNavArea_Null::StaticClass();
+        }
+        OmniActor->CustomDisabledAreaClass = DisabledArea;
         OmniActor->bCustomLinkEnabled = Proxy->IsSmartLinkEnabled();
 
         OmniActor->SetActorLabel(FString::Printf(TEXT("%s_Omni_Smart"), *Proxy->GetActorLabel()));

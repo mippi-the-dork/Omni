@@ -4,7 +4,7 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.60.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.60.1** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
 This development build completes the first-pass native Unreal NavLink migration coverage by adding **NavLinkProxy Segment Link migration**. Select one or more `NavLinkProxy` actors with SegmentLinks, then use **Omni > Convert NavLinkProxy Segment Links to Omni** from the Level Editor actor context menu. Omni creates one non-destructive `OmniSplineNavLink` for each native SegmentLink and leaves the source NavLinkProxy untouched.
 
