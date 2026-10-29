@@ -4,17 +4,17 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.60.1** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.64.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-This development build completes the first-pass native Unreal NavLink migration coverage by adding **NavLinkProxy Segment Link migration**. Select one or more `NavLinkProxy` actors with SegmentLinks, then use **Omni > Convert NavLinkProxy Segment Links to Omni** from the Level Editor actor context menu. Omni creates one non-destructive `OmniSplineNavLink` for each native SegmentLink and leaves the source NavLinkProxy untouched.
+This development build continues post-migration native-navigation integration hardening with **path-following interruption ownership checks**. Jump, Mantle, and Custom traversal now verify that Unreal's `UPathFollowingComponent` still reports their exact generated `UNavLinkCustomComponent` as the current custom link. If AI MoveTo, Behavior Tree Move To, repathing, or another move request aborts/replaces the traversal while the objects remain alive, Omni cancels the stale traversal immediately instead of waiting for timeout.
 
-The native LeftStart/LeftEnd segment becomes the Omni Source Spline and RightStart/RightEnd becomes the Target Spline. Both are authored as straight linear splines. The converted actor uses **Matched Grid** pairing, **Native Movement**, the source direction, Nav Area, Supported Agents, Snap Radius, and native projection-height intent. Max Crossing Distance is disabled so an existing wide crossing is not rejected by Omni's normal authoring default.
+Traversal cleanup now calls `FinishUsingCustomLink()` only while that traversal still owns Unreal's current custom link, so stale Jump/Mantle/Custom cleanup cannot accidentally advance a newer move. Custom `CompleteTraversal` and `CompleteAllTraversals` also classify a late completion as Cancelled when path following has already left that link. Mantle cancellation restores the previous Character Movement mode; Jump stops Omni tracking without claiming ownership of the newer path-following state.
 
-A native `FNavigationSegmentLink` is continuous, while Omni Spline publishes sampled native point links. Segment migration therefore preserves the authored two-segment relationship behaviorally rather than retaining one literal `FNavigationSegmentLink`. The converter uses the source Snap Radius as its preferred custom sample spacing, raises the converted actor's sample/link caps as needed within Omni's normal limits, and logs an explicit warning if the 1024 generated-link cap can affect a very large segment. The original NavLinkProxy remains available for validation and comparison.
+The 0.63 relevant-NavData filtering and 0.62 Supported Agents hardening remain intact, as does the 0.61 runtime Custom smart-link enabled-state override.
 
-The existing **Convert NavLinkProxy Point Links to Omni** and **Convert NavLinkProxy Smart Links to Omni** workflows remain available. Point, Segment, and Smart Link authoring now all have non-destructive Omni migration paths. Settings that Omni cannot currently represent exactly, including native Snap Height, Snap to Cheapest Area, custom link flags, and asymmetric projection heights, are reported rather than silently discarded.
+The existing **Convert NavLinkProxy Point Links to Omni**, **Convert NavLinkProxy Segment Links to Omni**, and **Convert NavLinkProxy Smart Links to Omni** workflows remain available. Point, Segment, and Smart Link authoring all have non-destructive Omni migration paths. Settings that Omni cannot currently represent exactly, including native Snap Height, Snap to Cheapest Area, custom link flags, and asymmetric projection heights, are reported rather than silently discarded.
 
-See `Doc/NavLinkProxy-Segment-Migration-Test-Plan.md`, `Doc/NavLinkProxy-Smart-Link-Migration-Test-Plan.md`, and `Doc/NavLinkProxy-Point-Migration-Test-Plan.md` for focused migration regression passes. The current 1.0 release bar is tracked in `Doc/1.0-Release-Requirements.md`.
+See `Doc/Path-Following-Interruption-Hardening-Test-Plan.md` for the 0.64 path-following interruption pass, `Doc/NavData-Rebuild-Filtering-Test-Plan.md` for the 0.63 rebuild-filtering pass, `Doc/Supported-Agents-Integration-Hardening-Test-Plan.md` for the 0.62 agent-mask pass, `Doc/Runtime-Smart-Link-State-Persistence-Test-Plan.md` for the 0.61 runtime-state pass, and the three NavLinkProxy migration test plans for migration coverage. The current 1.0 release bar is tracked in `Doc/1.0-Release-Requirements.md`.
 
 ### Built-in Mantle Traversal
 
@@ -90,6 +90,8 @@ Each Omni authoring actor exposes an internal **Custom Traversal** component. Fo
 Move the Pawn using your own logic, then call **Complete Custom Traversal** on the same Custom Traversal component with the Request Id. Omni releases the smart link and normal path following resumes. **On Traversal Finished** reports whether that request Completed, Timed Out, was Cancelled by regeneration/cleanup, or was released because no request listener was bound.
 
 **Custom Traversal Timeout** defaults to 5 seconds and prevents a forgotten completion call from holding path following forever. If no listener is bound when the AI reaches the link, Omni releases the link immediately rather than deadlocking the path follower.
+
+**Set Custom Links Enabled** can toggle the generated Custom smart links at runtime without requiring a NavMesh rebuild. That runtime state is preserved across normal Omni regeneration. **Are Custom Links Enabled** reports the effective runtime state. Changing the authored **Custom Link Enabled** default on Omni Point intentionally clears the transient runtime override and makes the new authored value authoritative again.
 
 Custom links are drawn as dashed purple traversal lines in the editor preview. Preview color communicates traversal type, while arrowheads communicate direction.
 

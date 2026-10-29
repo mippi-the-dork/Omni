@@ -48,6 +48,20 @@ void UOmniCustomTraversalComponent::RebuildLinks(
         return;
     }
 
+    // Runtime smart-link enable/disable is intentionally independent from the authored
+    // default. Preserve an explicit runtime override across regeneration (for example
+    // after a dynamic navigation rebuild or endpoint update). If the authored default
+    // itself changes, that is a deliberate authoring change and becomes authoritative
+    // again, clearing the transient runtime override.
+    const bool bAuthoredEnabledChanged = bHasCachedConfiguration && bCachedAuthoredLinksEnabled != bLinksEnabled;
+    if (!bHasCachedConfiguration || bAuthoredEnabledChanged)
+    {
+        bCachedLinksEnabled = bLinksEnabled;
+        bHasRuntimeEnabledOverride = false;
+    }
+
+    const bool bEffectiveLinksEnabled = bHasRuntimeEnabledOverride ? bCachedLinksEnabled : bLinksEnabled;
+
     TraversalTimeout = FMath::Max(0.25f, InTraversalTimeout);
 
     while (CustomLinks.Num() > LinkSpecs.Num())
@@ -121,7 +135,7 @@ void UOmniCustomTraversalComponent::RebuildLinks(
         Link->SetEnabledArea(ResolvedAreaClass);
         Link->SetDisabledArea(ResolvedDisabledAreaClass);
         Link->SetLinkData(RelativeStart, RelativeEnd, Spec.Direction);
-        Link->SetEnabled(bLinksEnabled);
+        Link->SetEnabled(bEffectiveLinksEnabled);
 
         if (!Link->IsRegistered() && Owner->GetWorld())
         {
@@ -138,13 +152,15 @@ void UOmniCustomTraversalComponent::RebuildLinks(
     CachedSupportedAgents = InSupportedAgents;
     CachedAreaClass = AreaClass.Get();
     CachedDisabledAreaClass = DisabledAreaClass.Get();
-    bCachedLinksEnabled = bLinksEnabled;
+    bCachedAuthoredLinksEnabled = bLinksEnabled;
+    bCachedLinksEnabled = bEffectiveLinksEnabled;
     bHasCachedConfiguration = true;
 }
 
 void UOmniCustomTraversalComponent::SetLinksEnabled(bool bEnabled)
 {
     bCachedLinksEnabled = bEnabled;
+    bHasRuntimeEnabledOverride = true;
     for (UNavLinkCustomComponent* Link : CustomLinks)
     {
         if (IsValid(Link))
@@ -177,7 +193,9 @@ void UOmniCustomTraversalComponent::ClearLinks()
     CachedLinkSpecs.Reset();
     CachedAreaClass.Reset();
     CachedDisabledAreaClass.Reset();
+    bCachedAuthoredLinksEnabled = true;
     bCachedLinksEnabled = true;
+    bHasRuntimeEnabledOverride = false;
     bHasCachedConfiguration = false;
     SetComponentTickEnabled(false);
 }
@@ -287,7 +305,18 @@ void UOmniCustomTraversalComponent::TickComponent(float DeltaTime, ELevelTick Ti
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
     {
         FActiveCustomTraversal& Traversal = ActiveTraversals[Index];
-        if (!Traversal.PathFollowing.IsValid() || !Traversal.Link.IsValid())
+        UPathFollowingComponent* PathFollowing = Traversal.PathFollowing.Get();
+        UNavLinkCustomComponent* Link = Traversal.Link.Get();
+        if (!PathFollowing || !Link)
+        {
+            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
+            continue;
+        }
+
+        // AI MoveTo/Behavior Tree Move To may abort or replace a move while both
+        // objects remain alive. Treat loss of this exact current custom link as an
+        // immediate cancellation instead of holding the request until timeout.
+        if (PathFollowing->GetCurrentCustomLinkOb() != Link)
         {
             FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
             continue;
@@ -312,7 +341,13 @@ void UOmniCustomTraversalComponent::CompleteTraversal(int32 RequestId)
     {
         if (ActiveTraversals[Index].Request.RequestId == RequestId)
         {
-            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Completed);
+            const FActiveCustomTraversal& Traversal = ActiveTraversals[Index];
+            UPathFollowingComponent* PathFollowing = Traversal.PathFollowing.Get();
+            UNavLinkCustomComponent* Link = Traversal.Link.Get();
+            const bool bStillOwnsCurrentLink = PathFollowing && Link && PathFollowing->GetCurrentCustomLinkOb() == Link;
+            FinishTraversalAtIndex(
+                Index,
+                bStillOwnsCurrentLink ? EOmniCustomTraversalFinishReason::Completed : EOmniCustomTraversalFinishReason::Cancelled);
             return;
         }
     }
@@ -322,7 +357,13 @@ void UOmniCustomTraversalComponent::CompleteAllTraversals()
 {
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
     {
-        FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Completed);
+        const FActiveCustomTraversal& Traversal = ActiveTraversals[Index];
+        UPathFollowingComponent* PathFollowing = Traversal.PathFollowing.Get();
+        UNavLinkCustomComponent* Link = Traversal.Link.Get();
+        const bool bStillOwnsCurrentLink = PathFollowing && Link && PathFollowing->GetCurrentCustomLinkOb() == Link;
+        FinishTraversalAtIndex(
+            Index,
+            bStillOwnsCurrentLink ? EOmniCustomTraversalFinishReason::Completed : EOmniCustomTraversalFinishReason::Cancelled);
     }
 }
 
@@ -367,7 +408,13 @@ void UOmniCustomTraversalComponent::FinishTraversalAtIndex(int32 Index, EOmniCus
     {
         if (UNavLinkCustomComponent* Link = Traversal.Link.Get())
         {
-            PathFollowing->FinishUsingCustomLink(Link);
+            // Completion is only valid while this request still owns Unreal's current
+            // custom link. Do not let late Blueprint completion or stale teardown
+            // resume/advance a newer AI move that has already replaced this one.
+            if (PathFollowing->GetCurrentCustomLinkOb() == Link)
+            {
+                PathFollowing->FinishUsingCustomLink(Link);
+            }
         }
     }
 
@@ -430,7 +477,7 @@ bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
         || !CachedSupportedAgents.IsSame(InSupportedAgents)
         || CachedAreaClass.Get() != AreaClass.Get()
         || CachedDisabledAreaClass.Get() != DisabledAreaClass.Get()
-        || bCachedLinksEnabled != bLinksEnabled
+        || bCachedAuthoredLinksEnabled != bLinksEnabled
         || !FMath::IsNearlyEqual(TraversalTimeout, FMath::Max(0.25f, InTraversalTimeout)))
     {
         return false;
@@ -446,7 +493,8 @@ bool UOmniCustomTraversalComponent::IsConfigurationEquivalent(
     {
         if (!IsValid(Link)
             || Link->GetOwner() != Owner
-            || (Owner->GetWorld() && !Link->IsRegistered()))
+            || (Owner->GetWorld() && !Link->IsRegistered())
+            || !Link->GetSupportedAgents().IsSame(InSupportedAgents))
         {
             return false;
         }

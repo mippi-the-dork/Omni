@@ -219,6 +219,15 @@ void UOmniJumpTraversalComponent::TickComponent(float DeltaTime, ELevelTick Tick
             continue;
         }
 
+        // A PathFollowingComponent can remain valid after its move was aborted,
+        // replaced, or repathed. Only keep controlling this traversal while Unreal
+        // still reports this exact generated smart link as the active custom link.
+        if (PathFollowing->GetCurrentCustomLinkOb() != Link)
+        {
+            FinishTraversalAtIndex(Index);
+            continue;
+        }
+
         Traversal.ElapsedTime += DeltaTime;
 
         const FVector CharacterLocation = Character->GetActorLocation();
@@ -257,7 +266,12 @@ void UOmniJumpTraversalComponent::FinishTraversalAtIndex(int32 Index)
     {
         if (UNavLinkCustomComponent* Link = Traversal.Link.Get())
         {
-            PathFollowing->FinishUsingCustomLink(Link);
+            // Do not finish a stale link after AI MoveTo/BT Move To has already
+            // aborted or replaced the request and moved path following elsewhere.
+            if (PathFollowing->GetCurrentCustomLinkOb() == Link)
+            {
+                PathFollowing->FinishUsingCustomLink(Link);
+            }
         }
     }
 }
@@ -308,7 +322,8 @@ bool UOmniJumpTraversalComponent::IsConfigurationEquivalent(
     {
         if (!IsValid(Link)
             || Link->GetOwner() != Owner
-            || (Owner->GetWorld() && !Link->IsRegistered()))
+            || (Owner->GetWorld() && !Link->IsRegistered())
+            || !Link->GetSupportedAgents().IsSame(InSupportedAgents))
         {
             return false;
         }

@@ -2,6 +2,7 @@
 #include "HAL/PlatformTime.h"
 
 #include "OmniEditorDiagnostics.h"
+#include "OmniNavigationUtils.h"
 
 #include "OmniJumpTraversalComponent.h"
 #include "OmniMantleTraversalComponent.h"
@@ -1981,6 +1982,7 @@ void AOmniVolumeNavLink::UpdateGenerationStatus()
         Status += TEXT(" Grid sampling was automatically limited by the safety cap.");
     }
 
+    OmniNavigation::AppendSupportedAgentCompatibilityWarning(this, SupportedAgents, Status);
     GenerationStatus = FText::FromString(Status);
 }
 
@@ -2259,6 +2261,11 @@ void AOmniVolumeNavLink::UnbindNavigationGenerationDelegate()
 void AOmniVolumeNavLink::HandleNavigationGenerationFinished(ANavigationData* NavData)
 {
     if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
+    {
+        return;
+    }
+
+    if (!OmniNavigation::ShouldRegenerateForNavigationData(this, SupportedAgents, NavData))
     {
         return;
     }

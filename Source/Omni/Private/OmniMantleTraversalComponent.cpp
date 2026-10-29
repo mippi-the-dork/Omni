@@ -236,6 +236,15 @@ void UOmniMantleTraversalComponent::TickComponent(float DeltaTime, ELevelTick Ti
             continue;
         }
 
+        // The path-following object can outlive the move that entered this link.
+        // Stop the mantle immediately if Unreal has aborted/replaced the request or
+        // switched to another custom link, and restore the character movement mode.
+        if (PathFollowing->GetCurrentCustomLinkOb() != Link)
+        {
+            FinishTraversalAtIndex(Index, false);
+            continue;
+        }
+
         Traversal.ElapsedTime += DeltaTime;
         const float Alpha = FMath::Clamp(Traversal.ElapsedTime / Duration, 0.0f, 1.0f);
         const FVector DesiredLocation = OmniTraversal::CalculateMantlePathPoint(
@@ -300,7 +309,12 @@ void UOmniMantleTraversalComponent::FinishTraversalAtIndex(int32 Index, bool bSn
     {
         if (UNavLinkCustomComponent* Link = Traversal.Link.Get())
         {
-            PathFollowing->FinishUsingCustomLink(Link);
+            // Only release path following when this traversal still owns the current
+            // custom link. A newer move/link must never be completed by stale cleanup.
+            if (PathFollowing->GetCurrentCustomLinkOb() == Link)
+            {
+                PathFollowing->FinishUsingCustomLink(Link);
+            }
         }
     }
 }
@@ -348,7 +362,8 @@ bool UOmniMantleTraversalComponent::IsConfigurationEquivalent(
     {
         if (!IsValid(Link)
             || Link->GetOwner() != Owner
-            || (Owner->GetWorld() && !Link->IsRegistered()))
+            || (Owner->GetWorld() && !Link->IsRegistered())
+            || !Link->GetSupportedAgents().IsSame(InSupportedAgents))
         {
             return false;
         }

@@ -82,7 +82,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Omni|Custom Traversal", meta=(DisplayName="Set Custom Links Enabled"))
     void SetLinksEnabled(bool bEnabled);
 
-    /** Current enabled state shared by the generated Custom smart links. */
+    /** Current effective enabled state shared by the generated Custom smart links. */
     UFUNCTION(BlueprintPure, Category="Omni|Custom Traversal", meta=(DisplayName="Are Custom Links Enabled"))
     bool AreLinksEnabled() const { return bCachedLinksEnabled; }
 
@@ -128,6 +128,11 @@ private:
     FNavAgentSelector CachedSupportedAgents;
     TWeakObjectPtr<UClass> CachedAreaClass;
     TWeakObjectPtr<UClass> CachedDisabledAreaClass;
+    // Authored/default state supplied by the owning Omni actor on the most recent rebuild.
+    bool bCachedAuthoredLinksEnabled = true;
+
+    // Effective runtime state. SetLinksEnabled may temporarily override the authored default.
     bool bCachedLinksEnabled = true;
+    bool bHasRuntimeEnabledOverride = false;
     bool bHasCachedConfiguration = false;
 };

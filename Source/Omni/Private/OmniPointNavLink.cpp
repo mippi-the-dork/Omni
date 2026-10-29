@@ -2,6 +2,7 @@
 #include "HAL/PlatformTime.h"
 
 #include "OmniEditorDiagnostics.h"
+#include "OmniNavigationUtils.h"
 
 #include "OmniJumpTraversalComponent.h"
 #include "OmniMantleTraversalComponent.h"
@@ -1336,6 +1337,7 @@ void AOmniPointNavLink::UpdateGenerationStatus()
         }
     }
 
+    OmniNavigation::AppendSupportedAgentCompatibilityWarning(this, SupportedAgents, Status);
     GenerationStatus = FText::FromString(Status);
 }
 
@@ -1603,6 +1605,11 @@ void AOmniPointNavLink::UnbindNavigationGenerationDelegate()
 void AOmniPointNavLink::HandleNavigationGenerationFinished(ANavigationData* NavData)
 {
     if (!CanRegenerateNow() || !bRegenerateAfterNavigationBuild || !NavData || NavData->GetWorld() != GetWorld())
+    {
+        return;
+    }
+
+    if (!OmniNavigation::ShouldRegenerateForNavigationData(this, SupportedAgents, NavData))
     {
         return;
     }
