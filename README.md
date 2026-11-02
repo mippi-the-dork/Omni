@@ -4,7 +4,9 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.64.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.66.10** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+
+This development build includes the native Navigation System automation gate introduced in 0.66. The 0.66.10 fixture uses Unreal Engine 5.8's `FScopedEditorWorld` lifecycle instead of hand-managing transient `FWorldContext` ownership. The test world is created uninitialized, then the engine helper temporarily places it in the existing editor world context and initializes the world. Because UE 5.8 `UWorld::InitWorld()` deliberately adds Navigation with `bInitializeForWorld=false`, the fixture then completes the Navigation System's public `InitializeForWorld(..., EditorMode)` step and validates `IsWorldInitDone()` before creating Recast bounds or running path queries. The engine helper owns the matching destruction/restoration sequence. The fixture uses the Navigation System's configured Supported Agents and mask directly and rejects any NavData that does not map back to a supported agent. The navigation tests still require real projected NavMesh surfaces and valid same-island paths before any disconnected-gap assertion can pass.
 
 This development build continues post-migration native-navigation integration hardening with **path-following interruption ownership checks**. Jump, Mantle, and Custom traversal now verify that Unreal's `UPathFollowingComponent` still reports their exact generated `UNavLinkCustomComponent` as the current custom link. If AI MoveTo, Behavior Tree Move To, repathing, or another move request aborts/replaces the traversal while the objects remain alive, Omni cancels the stale traversal immediately instead of waiting for timeout.
 
@@ -429,3 +431,17 @@ Point, Volume, and Spline Omni actors expose two blocker actions under **Omni | 
 These actions are especially useful with Volume and Spline generation where several rejected crossings can point at different pieces of level geometry. Both use diagnostics already produced during generation and do not perform additional collision queries or change link validity.
 
 If the current rejected diagnostics do not identify a blocking actor, such as missing support or speed-only failures, there is nothing to select or focus and the current viewport is left alone.
+
+## Native Automation Tests
+
+Omni includes Unreal Automation Framework tests and does not depend on Probe. Run the current regression suite from the Unreal console with:
+
+```text
+Automation RunTests Omni
+```
+
+Focused families are available under `Omni.Generation.*` and `Omni.Migration.Mapping.*`. See `Doc/Native-Automation-Foundation.md` for the current test inventory and release-gate expectations.
+
+
+
+Omni 0.66 extends the automation gate with isolated transient-world Recast path-query tests for Point connectivity, directionality, disabling/re-enabling, and endpoint regeneration.

@@ -284,6 +284,20 @@ void AOmniPointNavLink::RecheckDiagnostics()
     }
 }
 
+#if WITH_DEV_AUTOMATION_TESTS
+bool AOmniPointNavLink::AutomationGenerateProjectedConnection(
+    const FVector& SourceWorld,
+    const FVector& TargetWorld,
+    TArray<FNavigationLink>& OutNativeLinks,
+    TArray<FOmniJumpLinkSpec>& OutJumpLinks,
+    TArray<FOmniMantleLinkSpec>& OutMantleLinks,
+    TArray<FOmniCustomLinkSpec>& OutCustomLinks)
+{
+    ResetDebugState();
+    return GenerateProjectedConnection(SourceWorld, TargetWorld, OutNativeLinks, OutJumpLinks, OutMantleLinks, OutCustomLinks);
+}
+#endif
+
 void AOmniPointNavLink::RegenerateLink()
 {
     if (bIsRegenerating || !CanRegenerateNow() || !GeneratedLinks || !SourcePoint || !TargetPoint)

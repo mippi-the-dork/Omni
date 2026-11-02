@@ -82,6 +82,18 @@ public:
     UFUNCTION(CallInEditor, Category="Omni|Actions|Diagnostics", meta=(DisplayName="Recheck Diagnostics"))
     void RecheckDiagnostics();
 
+
+#if WITH_DEV_AUTOMATION_TESTS
+    /** Test-only path that exercises generation after projection without requiring a NavMesh fixture. */
+    bool AutomationGenerateProjectedConnection(
+        const FVector& SourceWorld,
+        const FVector& TargetWorld,
+        TArray<FNavigationLink>& OutNativeLinks,
+        TArray<FOmniJumpLinkSpec>& OutJumpLinks,
+        TArray<FOmniMantleLinkSpec>& OutMantleLinks,
+        TArray<FOmniCustomLinkSpec>& OutCustomLinks);
+#endif
+
     // ---------------------------------------------------------------------
     // Normal setup
     // ---------------------------------------------------------------------

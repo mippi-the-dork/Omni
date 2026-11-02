@@ -1,4 +1,5 @@
 #include "OmniModule.h"
+#include "OmniMigrationUtils.h"
 
 #include "Modules/ModuleManager.h"
 
@@ -46,34 +47,6 @@ DEFINE_LOG_CATEGORY_STATIC(LogOmniMigration, Log, All);
 
 namespace
 {
-EOmniPointLinkDirection ToOmniDirection(const ENavLinkDirection::Type NativeDirection)
-{
-    switch (NativeDirection)
-    {
-    case ENavLinkDirection::LeftToRight:
-        return EOmniPointLinkDirection::SourceToTarget;
-    case ENavLinkDirection::RightToLeft:
-        return EOmniPointLinkDirection::TargetToSource;
-    case ENavLinkDirection::BothWays:
-    default:
-        return EOmniPointLinkDirection::BothWays;
-    }
-}
-
-EOmniSplineLinkDirection ToOmniSplineDirection(const ENavLinkDirection::Type NativeDirection)
-{
-    switch (NativeDirection)
-    {
-    case ENavLinkDirection::LeftToRight:
-        return EOmniSplineLinkDirection::SourceToTarget;
-    case ENavLinkDirection::RightToLeft:
-        return EOmniSplineLinkDirection::TargetToSource;
-    case ENavLinkDirection::BothWays:
-    default:
-        return EOmniSplineLinkDirection::BothWays;
-    }
-}
-
 bool HasConvertiblePointLinks(const ANavLinkProxy* Proxy)
 {
     return IsValid(Proxy) && Proxy->PointLinks.Num() > 0;
@@ -446,7 +419,7 @@ void FOmniModule::ConvertSelectedNavLinkProxies()
             // the source actor transform makes these a direct local-space transfer.
             OmniActor->SourcePoint->SetRelativeLocation(NativeLink.Left);
             OmniActor->TargetPoint->SetRelativeLocation(NativeLink.Right);
-            OmniActor->LinkDirection = ToOmniDirection(NativeLink.Direction);
+            OmniActor->LinkDirection = OmniMigration::ToPointDirection(NativeLink.Direction);
             OmniActor->TraversalAction = EOmniTraversalAction::NativeMovement;
             OmniActor->bUseDirectionalTraversalActions = false;
             OmniActor->MaximumLinkDistance = 0.0f;
@@ -454,10 +427,8 @@ void FOmniModule::ConvertSelectedNavLinkProxies()
             OmniActor->AreaClass = NativeLink.GetAreaClass()
                 ? NativeLink.GetAreaClass()
                 : UNavArea_Default::StaticClass();
-            OmniActor->SnapRadius = FMath::Max(1.0f, NativeLink.SnapRadius);
-            OmniActor->NativeProjectionHeight = FMath::Max(
-                0.0f,
-                FMath::Max(NativeLink.LeftProjectHeight, NativeLink.MaxFallDownLength));
+            OmniActor->SnapRadius = OmniMigration::ResolveSnapRadius(NativeLink.SnapRadius);
+            OmniActor->NativeProjectionHeight = OmniMigration::ResolveProjectionHeight(NativeLink);
 
             const FString DesiredLabel = Proxy->PointLinks.Num() == 1
                 ? FString::Printf(TEXT("%s_Omni"), *SourceLabel)
@@ -613,7 +584,7 @@ void FOmniModule::ConvertSelectedSegmentLinks()
             ConfigureLinearSpline(*OmniActor->SourceSpline, NativeLink.LeftStart, NativeLink.LeftEnd);
             ConfigureLinearSpline(*OmniActor->TargetSpline, NativeLink.RightStart, NativeLink.RightEnd);
 
-            OmniActor->LinkDirection = ToOmniSplineDirection(NativeLink.Direction);
+            OmniActor->LinkDirection = OmniMigration::ToSplineDirection(NativeLink.Direction);
             OmniActor->PairingMode = EOmniPairingMode::MatchedGrid;
             OmniActor->ClosedSplineCoverage = EOmniClosedSplineCoverage::Perimeter;
             OmniActor->CoverageDensity = EOmniCoverageDensity::Custom;
@@ -624,19 +595,17 @@ void FOmniModule::ConvertSelectedSegmentLinks()
             OmniActor->AreaClass = NativeLink.GetAreaClass()
                 ? NativeLink.GetAreaClass()
                 : UNavArea_Default::StaticClass();
-            OmniActor->SnapRadius = FMath::Max(1.0f, NativeLink.SnapRadius);
-            OmniActor->NativeProjectionHeight = FMath::Max(
-                0.0f,
-                FMath::Max(NativeLink.LeftProjectHeight, NativeLink.MaxFallDownLength));
+            OmniActor->SnapRadius = OmniMigration::ResolveSnapRadius(NativeLink.SnapRadius);
+            OmniActor->NativeProjectionHeight = OmniMigration::ResolveProjectionHeight(NativeLink);
 
             // A native SegmentLink is continuous. Omni Spline represents it with matched
             // native point links. Use the native Snap Radius as the preferred sample gap
             // so neighboring generated-link snap regions overlap in the common case.
-            const float PreferredSpacing = FMath::Clamp(FMath::Max(10.0f, NativeLink.SnapRadius), 10.0f, 500.0f);
+            const float PreferredSpacing = OmniMigration::ResolveSegmentSpacing(NativeLink.SnapRadius);
             OmniActor->LinkSpacing = PreferredSpacing;
 
             const float LongestSegmentLength = FMath::Max(SourceLengthWorld, TargetLengthWorld);
-            const int32 DesiredSamples = FMath::Max(2, FMath::CeilToInt(LongestSegmentLength / PreferredSpacing) + 1);
+            const int32 DesiredSamples = OmniMigration::ResolveSegmentSampleCount(LongestSegmentLength, PreferredSpacing);
             OmniActor->MaximumSamplesPerSpline = FMath::Clamp(DesiredSamples, 2, 4096);
             OmniActor->MaximumGeneratedLinks = FMath::Clamp(DesiredSamples, 1, 1024);
 
@@ -794,7 +763,7 @@ void FOmniModule::ConvertSelectedSmartLinks()
         // source proxy transform so this remains a direct local-space transfer.
         OmniActor->SourcePoint->SetRelativeLocation(RelativeStart);
         OmniActor->TargetPoint->SetRelativeLocation(RelativeEnd);
-        OmniActor->LinkDirection = ToOmniDirection(NativeDirection);
+        OmniActor->LinkDirection = OmniMigration::ToPointDirection(NativeDirection);
         OmniActor->TraversalAction = EOmniTraversalAction::Custom;
         OmniActor->bUseDirectionalTraversalActions = false;
         OmniActor->MaximumLinkDistance = 0.0f;
