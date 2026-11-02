@@ -263,7 +263,60 @@ namespace OmniNavigationAutomation
             }
 
             NavigationSystem->ProcessPendingOctreeUpdates();
-            NavigationSystem->GetDefaultNavDataInstance(FNavigationSystem::Create);
+
+            // FScopedEditorWorld stops after editor-world initialization. A normal
+            // UWorld::InitializeActorsForPlay() later forwards this navigation-only
+            // lifecycle callback. Do not invoke the full gameplay initialization path
+            // here; it previously caused duplicate WorldSettings creation in this
+            // synthetic fixture. Complete only Navigation's public actor-init phase,
+            // once, after the transient geometry and NavMesh bounds exist.
+            if (!bNavigationActorsInitialized)
+            {
+                NavigationSystem->OnInitializeActors();
+                bNavigationActorsInitialized = true;
+                NavigationSystem->ProcessPendingOctreeUpdates();
+            }
+
+            // UE 5.8 can hold navigation generation behind AsyncLoadLock until the
+            // normal map-loading lifecycle reports that initial async loading is done.
+            // This transient editor world has no corresponding map-load completion
+            // event. The test issues an explicit Build(), so release only that lock
+            // without triggering an implicit rebuild.
+            constexpr uint8 AsyncLoadLockFlag = static_cast<uint8>(ENavigationBuildLock::AsyncLoadLock);
+            if (NavigationSystem->IsNavigationBuildingLocked(AsyncLoadLockFlag))
+            {
+                NavigationSystem->RemoveNavigationBuildLock(
+                    AsyncLoadLockFlag,
+                    UNavigationSystemV1::ELockRemovalRebuildAction::NoRebuild);
+            }
+
+            if (NavigationSystem->IsNavigationBuildingLocked(AsyncLoadLockFlag))
+            {
+                Test.AddError(TEXT("Transient Omni navigation build remains blocked by AsyncLoadLock."));
+                return false;
+            }
+
+            // Do not ask GetDefaultNavDataInstance(Create) to invent a generic NavData
+            // configuration. In an isolated world that can produce a Recast candidate
+            // whose agent dimensions do not match SupportedAgents and is then rejected
+            // as RegistrationFailed_AgentNotValid. If actor initialization did not
+            // already create a valid default NavData, construct Recast from the exact
+            // default supported-agent config instead.
+            NavData = NavigationSystem->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
+            if (!NavData)
+            {
+                FNavDataConfig RecastConfig = NavigationSystem->GetDefaultSupportedAgentConfig();
+                RecastConfig.SetNavDataClass(ARecastNavMesh::StaticClass());
+                NavData = NavigationSystem->CreateNavigationDataInstanceInLevel(RecastConfig, World->PersistentLevel);
+            }
+
+            if (!NavData)
+            {
+                Test.AddError(TEXT("Failed to create Recast navigation data from the transient world's supported-agent config."));
+                return false;
+            }
+
+            NavigationSystem->ProcessPendingOctreeUpdates();
             NavigationSystem->Build();
 
             const double StartSeconds = FPlatformTime::Seconds();
@@ -424,6 +477,7 @@ namespace OmniNavigationAutomation
         ANavigationData* NavData = nullptr;
         UStaticMesh* CubeMesh = nullptr;
         FNavAgentSelector SupportedAgentsMask;
+        bool bNavigationActorsInitialized = false;
     };
 
     const FVector LeftQuery(-450.0, 0.0, 20.0);
