@@ -1,5 +1,7 @@
 #include "OmniTestNavLink.h"
 
+#include "OmniNavigationUtils.h"
+
 #include "AI/Navigation/NavAgentSelector.h"
 #include "AI/NavigationSystemBase.h"
 #include "Components/BoxComponent.h"
@@ -79,11 +81,13 @@ void AOmniTestNavLink::RebuildGeneratedLinks()
         const FVector SourceWorld = SourceTransform.TransformPosition(FVector(0.0, SourceY, 0.0));
         const FVector TargetWorld = TargetTransform.TransformPosition(FVector(0.0, TargetY, 0.0));
 
-        const FVector SourceLinkLocal = LinkTransform.InverseTransformPosition(SourceWorld);
-        const FVector TargetLinkLocal = LinkTransform.InverseTransformPosition(TargetWorld);
+        FVector NativeLeft = LinkTransform.InverseTransformPosition(SourceWorld);
+        FVector NativeRight = LinkTransform.InverseTransformPosition(TargetWorld);
+        ENavLinkDirection::Type NativeDirection = Direction;
+        OmniNavigation::CanonicalizeNativeSimpleLink(NativeLeft, NativeRight, NativeDirection);
 
-        FNavigationLink& Link = NewLinks.Emplace_GetRef(SourceLinkLocal, TargetLinkLocal);
-        Link.Direction = Direction;
+        FNavigationLink& Link = NewLinks.Emplace_GetRef(NativeLeft, NativeRight);
+        Link.Direction = NativeDirection;
         Link.SnapRadius = FMath::Max(1.0f, SnapRadius);
         Link.LeftProjectHeight = FMath::Max(0.0f, ProjectionHeight);
         Link.MaxFallDownLength = FMath::Max(0.0f, ProjectionHeight);

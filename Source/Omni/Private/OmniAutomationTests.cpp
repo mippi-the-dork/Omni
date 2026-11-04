@@ -114,13 +114,14 @@ bool FOmniPointNativeDirectionsTest::RunTest(const FString& Parameters)
     {
         EOmniPointLinkDirection OmniDirection;
         ENavLinkDirection::Type ExpectedNativeDirection;
+        bool bExpectReversedEndpoints;
         const TCHAR* Name;
     };
 
     const FCase Cases[] = {
-        { EOmniPointLinkDirection::BothWays, ENavLinkDirection::BothWays, TEXT("Both Ways") },
-        { EOmniPointLinkDirection::SourceToTarget, ENavLinkDirection::LeftToRight, TEXT("Source to Target") },
-        { EOmniPointLinkDirection::TargetToSource, ENavLinkDirection::RightToLeft, TEXT("Target to Source") },
+        { EOmniPointLinkDirection::BothWays, ENavLinkDirection::BothWays, false, TEXT("Both Ways") },
+        { EOmniPointLinkDirection::SourceToTarget, ENavLinkDirection::LeftToRight, false, TEXT("Source to Target") },
+        { EOmniPointLinkDirection::TargetToSource, ENavLinkDirection::LeftToRight, true, TEXT("Target to Source") },
     };
 
     for (const FCase& Case : Cases)
@@ -131,7 +132,15 @@ bool FOmniPointNativeDirectionsTest::RunTest(const FString& Parameters)
         TestEqual(FString::Printf(TEXT("%s native link count"), Case.Name), NativeLinks.Num(), 1);
         if (NativeLinks.Num() == 1)
         {
+            const FTransform LinkTransform = Point->GeneratedLinks->GetComponentTransform();
+            const FVector SourceLocal = LinkTransform.InverseTransformPosition(Source);
+            const FVector TargetLocal = LinkTransform.InverseTransformPosition(Target);
+            const FVector ExpectedLeft = Case.bExpectReversedEndpoints ? TargetLocal : SourceLocal;
+            const FVector ExpectedRight = Case.bExpectReversedEndpoints ? SourceLocal : TargetLocal;
+
             TestEqual(FString::Printf(TEXT("%s native direction"), Case.Name), NativeLinks[0].Direction.GetValue(), Case.ExpectedNativeDirection);
+            TestTrue(FString::Printf(TEXT("%s native left endpoint"), Case.Name), NativeLinks[0].Left.Equals(ExpectedLeft, KINDA_SMALL_NUMBER));
+            TestTrue(FString::Printf(TEXT("%s native right endpoint"), Case.Name), NativeLinks[0].Right.Equals(ExpectedRight, KINDA_SMALL_NUMBER));
         }
     }
 
@@ -231,7 +240,12 @@ bool FOmniPointHeightReductionTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    TestEqual(TEXT("Only Target to Source remains"), NativeLinks[0].Direction.GetValue(), ENavLinkDirection::RightToLeft);
+    const FTransform LinkTransform = Point->GeneratedLinks->GetComponentTransform();
+    const FVector SourceLocal = LinkTransform.InverseTransformPosition(FVector::ZeroVector);
+    const FVector TargetLocal = LinkTransform.InverseTransformPosition(FVector(200.0, 0.0, 100.0));
+    TestEqual(TEXT("Target to Source is canonicalized as a one-way native link"), NativeLinks[0].Direction.GetValue(), ENavLinkDirection::LeftToRight);
+    TestTrue(TEXT("Canonicalized reverse link starts at Target"), NativeLinks[0].Left.Equals(TargetLocal, KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Canonicalized reverse link ends at Source"), NativeLinks[0].Right.Equals(SourceLocal, KINDA_SMALL_NUMBER));
     TestEqual(TEXT("Height restriction counted"), Point->HeightRestrictedLinkCount, 1);
     return true;
 }

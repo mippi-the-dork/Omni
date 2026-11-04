@@ -2,11 +2,25 @@
 
 #include "CoreMinimal.h"
 #include "AI/Navigation/NavAgentSelector.h"
+#include "AI/Navigation/NavLinkDefinition.h"
 
 class ANavigationData;
 
 namespace OmniNavigation
 {
+    /**
+     * Canonicalizes a native simple-link direction into the representation Omni
+     * gives UNavLinkComponent. UE 5.8 pathfinding in this component path does not
+     * reliably honor RightToLeft as a reverse one-way edge. Store reverse links
+     * as swapped endpoints with LeftToRight instead, which is behaviorally
+     * equivalent and is consumed correctly by Recast. BothWays and LeftToRight
+     * are left unchanged.
+     */
+    void CanonicalizeNativeSimpleLink(
+        FVector& InOutLeft,
+        FVector& InOutRight,
+        ENavLinkDirection::Type& InOutDirection);
+
     /**
      * Appends a concise warning when an Omni actor's Supported Agents mask cannot
      * be used by any configured navigation agent in the current world.

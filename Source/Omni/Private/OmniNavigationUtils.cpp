@@ -32,6 +32,18 @@ namespace
     }
 }
 
+void OmniNavigation::CanonicalizeNativeSimpleLink(
+    FVector& InOutLeft,
+    FVector& InOutRight,
+    ENavLinkDirection::Type& InOutDirection)
+{
+    if (InOutDirection == ENavLinkDirection::RightToLeft)
+    {
+        Swap(InOutLeft, InOutRight);
+        InOutDirection = ENavLinkDirection::LeftToRight;
+    }
+}
+
 void OmniNavigation::AppendSupportedAgentCompatibilityWarning(
     UObject* WorldContextObject,
     const FNavAgentSelector& SupportedAgents,

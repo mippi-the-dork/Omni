@@ -19,6 +19,7 @@
 #include "EditorWorldUtils.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/AutomationTest.h"
+#include "NavLinkComponent.h"
 #include "NavMesh/NavMeshBoundsVolume.h"
 #include "NavMesh/RecastNavMesh.h"
 #include "NavigationData.h"
@@ -433,22 +434,27 @@ namespace OmniNavigationAutomation
 
         bool SetupThreeIslandFixture()
         {
-            if (!AddPlatform(FVector(-450.0, 0.0, -25.0), FVector(600.0, 1200.0, 50.0)))
+            // Keep endpoint-regeneration geometry deliberately simple. The source
+            // island sits in the center with equal target islands to the left and
+            // right, so both the initial and regenerated native links are straight,
+            // horizontal connections of equal length. This isolates endpoint
+            // replacement from diagonal-link geometry and platform-shape variables.
+            if (!AddPlatform(FVector(0.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
             {
                 Test.AddError(TEXT("Failed to create the source navigation platform."));
                 return false;
             }
-            if (!AddPlatform(FVector(450.0, -400.0, -25.0), FVector(600.0, 500.0, 50.0)))
+            if (!AddPlatform(FVector(500.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
             {
                 Test.AddError(TEXT("Failed to create target navigation platform A."));
                 return false;
             }
-            if (!AddPlatform(FVector(450.0, 400.0, -25.0), FVector(600.0, 500.0, 50.0)))
+            if (!AddPlatform(FVector(-500.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
             {
                 Test.AddError(TEXT("Failed to create target navigation platform B."));
                 return false;
             }
-            if (!AddNavigationBounds(FVector::ZeroVector, FVector(1800.0, 1800.0, 600.0)))
+            if (!AddNavigationBounds(FVector::ZeroVector, FVector(1400.0, 900.0, 600.0)))
             {
                 Test.AddError(TEXT("Failed to create the transient NavMesh Bounds Volume."));
                 return false;
@@ -458,11 +464,24 @@ namespace OmniNavigationAutomation
                 return false;
             }
 
-            if (!ProjectsToNavigation(FVector(-450.0, 0.0, 20.0))
-                || !ProjectsToNavigation(FVector(450.0, -400.0, 20.0))
-                || !ProjectsToNavigation(FVector(450.0, 400.0, 20.0)))
+            const FVector SourceProbe(0.0, 0.0, 20.0);
+            const FVector TargetAProbe(500.0, 0.0, 20.0);
+            const FVector TargetBProbe(-500.0, 0.0, 20.0);
+            if (!ProjectsToNavigation(SourceProbe)
+                || !ProjectsToNavigation(TargetAProbe)
+                || !ProjectsToNavigation(TargetBProbe))
             {
                 Test.AddError(TEXT("Transient three-island Recast fixture did not produce navigable surfaces on all test platforms."));
+                return false;
+            }
+
+            // Projection alone is not enough proof. Require a complete path within
+            // every island before the fixture can be used to judge an Omni link.
+            if (!HasCompletePath(FVector(-100.0, 0.0, 20.0), FVector(100.0, 0.0, 20.0))
+                || !HasCompletePath(FVector(400.0, 0.0, 20.0), FVector(600.0, 0.0, 20.0))
+                || !HasCompletePath(FVector(-600.0, 0.0, 20.0), FVector(-400.0, 0.0, 20.0)))
+            {
+                Test.AddError(TEXT("Transient three-island Recast fixture could not path within one or more individual test platforms."));
                 return false;
             }
 
@@ -584,7 +603,22 @@ bool FOmniNavigationPointTargetToSourceTest::RunTest(const FString& Parameters)
         OmniNavigationAutomation::LeftLinkEndpoint,
         OmniNavigationAutomation::RightLinkEndpoint,
         EOmniPointLinkDirection::TargetToSource);
-    if (!TestNotNull(TEXT("Omni Point"), Point) || !TestWorld.BuildNavigation())
+    if (!TestNotNull(TEXT("Omni Point"), Point))
+    {
+        return false;
+    }
+
+    // The generation suite validates the canonical reverse native representation directly.
+    // This behavioral fixture intentionally avoids comparing raw GeneratedLinks endpoints
+    // against the authored points because RegenerateLink() projects both endpoints onto
+    // navigation before emitting the native link. Here we only require that one native
+    // link was generated, then let Recast prove the traversal direction.
+    if (!TestEqual(TEXT("Omni generated one reverse native link"), Point->NativeLinkCount, 1))
+    {
+        return false;
+    }
+
+    if (!TestWorld.BuildNavigation())
     {
         return false;
     }
@@ -651,18 +685,23 @@ bool FOmniNavigationPointEndpointRegenerationTest::RunTest(const FString& Parame
         return false;
     }
 
-    const FVector SourceQuery(-450.0, 0.0, 20.0);
-    const FVector TargetAQuery(450.0, -400.0, 20.0);
-    const FVector TargetBQuery(450.0, 400.0, 20.0);
-    const FVector SourceEndpoint(-200.0, 0.0, 20.0);
-    const FVector TargetAEndpoint(200.0, -400.0, 20.0);
-    const FVector TargetBEndpoint(200.0, 400.0, 20.0);
+    const FVector SourceQuery(0.0, 0.0, 20.0);
+    const FVector TargetAQuery(500.0, 0.0, 20.0);
+    const FVector TargetBQuery(-500.0, 0.0, 20.0);
+    const FVector SourceEndpoint(0.0, 0.0, 20.0);
+    const FVector TargetAEndpoint(400.0, 0.0, 20.0);
+    const FVector TargetBEndpoint(-400.0, 0.0, 20.0);
 
     TestFalse(TEXT("Source cannot initially reach target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
     TestFalse(TEXT("Source cannot initially reach target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
 
     AOmniPointNavLink* Point = TestWorld.AddPointLink(SourceEndpoint, TargetAEndpoint, EOmniPointLinkDirection::BothWays);
-    if (!TestNotNull(TEXT("Omni Point"), Point) || !TestWorld.BuildNavigation())
+    if (!TestNotNull(TEXT("Omni Point"), Point))
+    {
+        return false;
+    }
+    TestEqual(TEXT("Initial endpoint produces one native link"), Point->NativeLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
     {
         return false;
     }
@@ -672,6 +711,7 @@ bool FOmniNavigationPointEndpointRegenerationTest::RunTest(const FString& Parame
 
     Point->TargetPoint->SetWorldLocation(TargetBEndpoint);
     Point->RegenerateLink();
+    TestEqual(TEXT("Regenerated endpoint still produces one native link"), Point->NativeLinkCount, 1);
     if (!TestWorld.BuildNavigation())
     {
         return false;

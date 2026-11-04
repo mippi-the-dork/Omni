@@ -1465,11 +1465,13 @@ bool AOmniSplineNavLink::AddProjectedPair(const FProjectedPair& Pair, const FPai
         }
         else
         {
-            const FVector SourceLocal = LinkTransform.InverseTransformPosition(Pair.SourceWorld);
-            const FVector TargetLocal = LinkTransform.InverseTransformPosition(Pair.TargetWorld);
+            FVector NativeLeft = LinkTransform.InverseTransformPosition(Pair.SourceWorld);
+            FVector NativeRight = LinkTransform.InverseTransformPosition(Pair.TargetWorld);
+            ENavLinkDirection::Type NativeDirection = Direction;
+            OmniNavigation::CanonicalizeNativeSimpleLink(NativeLeft, NativeRight, NativeDirection);
 
-            FNavigationLink& NewLink = InOutLinks.Emplace_GetRef(SourceLocal, TargetLocal);
-            NewLink.Direction = Direction;
+            FNavigationLink& NewLink = InOutLinks.Emplace_GetRef(NativeLeft, NativeRight);
+            NewLink.Direction = NativeDirection;
             NewLink.SnapRadius = FMath::Max(1.0f, SnapRadius);
             NewLink.LeftProjectHeight = FMath::Max(0.0f, NativeProjectionHeight);
             NewLink.MaxFallDownLength = FMath::Max(0.0f, NativeProjectionHeight);
