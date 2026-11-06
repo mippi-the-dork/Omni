@@ -1584,12 +1584,12 @@ bool AOmniPointNavLink::CanRegenerateNow() const
 
 void AOmniPointNavLink::NotifyNavigationSystem()
 {
-    if (!GeneratedLinks || !GeneratedLinks->IsRegistered() || !GeneratedLinks->GetWorld())
+    if (!GeneratedLinks)
     {
         return;
     }
 
-    FNavigationSystem::UpdateComponentData(*GeneratedLinks);
+    OmniNavigation::RefreshNativeLinkComponentNavigation(*GeneratedLinks);
 }
 
 void AOmniPointNavLink::BindNavigationGenerationDelegate()

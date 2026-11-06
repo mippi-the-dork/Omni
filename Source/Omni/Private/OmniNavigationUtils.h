@@ -5,6 +5,7 @@
 #include "AI/Navigation/NavLinkDefinition.h"
 
 class ANavigationData;
+class UNavLinkComponent;
 
 namespace OmniNavigation
 {
@@ -20,6 +21,17 @@ namespace OmniNavigation
         FVector& InOutLeft,
         FVector& InOutRight,
         ENavLinkDirection::Type& InOutDirection);
+
+    /**
+     * Refreshes a generated UNavLinkComponent after Omni mutates its Links array.
+     *
+     * UNavLinkComponent can be registered while it contains zero links. If links are
+     * added later, a normal navigation-data update is not sufficient to make that
+     * component equivalent to one that registered with navigation-relevant data.
+     * Re-register through Unreal's public component lifecycle so generated-link
+     * mutations rebuild native navigation state in both editor and packaged targets.
+     */
+    void RefreshNativeLinkComponentNavigation(UNavLinkComponent& LinkComponent);
 
     /**
      * Appends a concise warning when an Omni actor's Supported Agents mask cannot

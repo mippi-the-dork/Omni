@@ -4,7 +4,9 @@ Omni is an Unreal Engine navigation authoring plugin for creating enhanced point
 
 ## Current development version
 
-**Omni 0.66.10** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.66.19** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+
+This development build keeps the generated-link registration fix while removing its dependency on Unreal's editor-only `bRegisteredForNavigation` implementation state. Point, Spline, Volume, and the internal native-link test actor now refresh generated native links through the public `ReregisterComponent()` lifecycle after link mutations, so empty-to-valid, valid-to-valid, and valid-to-empty transitions rebuild navigation state in both editor and packaged Win64 targets. The Point Recast integration suite remains the behavioral contract, and 0.67.x also adds the Spline native-navigation integration pass.
 
 This development build includes the native Navigation System automation gate introduced in 0.66. The 0.66.10 fixture uses Unreal Engine 5.8's `FScopedEditorWorld` lifecycle instead of hand-managing transient `FWorldContext` ownership. The test world is created uninitialized, then the engine helper temporarily places it in the existing editor world context and initializes the world. Because UE 5.8 `UWorld::InitWorld()` deliberately adds Navigation with `bInitializeForWorld=false`, the fixture then completes the Navigation System's public `InitializeForWorld(..., EditorMode)` step and validates `IsWorldInitDone()` before creating Recast bounds or running path queries. The engine helper owns the matching destruction/restoration sequence. The fixture uses the Navigation System's configured Supported Agents and mask directly and rejects any NavData that does not map back to a supported agent. The navigation tests still require real projected NavMesh surfaces and valid same-island paths before any disconnected-gap assertion can pass.
 

@@ -100,18 +100,19 @@ void AOmniTestNavLink::RebuildGeneratedLinks()
     GeneratedLinks->Links = MoveTemp(NewLinks);
     GeneratedLinkCount = GeneratedLinks->Links.Num();
 
+    GeneratedLinks->UpdateBounds();
     GeneratedLinks->MarkRenderStateDirty();
     NotifyNavigationSystem();
 }
 
 void AOmniTestNavLink::NotifyNavigationSystem()
 {
-    if (!GeneratedLinks || !GeneratedLinks->IsRegistered() || !GeneratedLinks->GetWorld())
+    if (!GeneratedLinks)
     {
         return;
     }
 
-    FNavigationSystem::UpdateComponentData(*GeneratedLinks);
+    OmniNavigation::RefreshNativeLinkComponentNavigation(*GeneratedLinks);
 }
 
 #if WITH_EDITOR

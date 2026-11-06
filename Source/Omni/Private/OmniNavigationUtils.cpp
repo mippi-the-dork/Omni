@@ -1,5 +1,6 @@
 #include "OmniNavigationUtils.h"
 
+#include "NavLinkComponent.h"
 #include "NavigationData.h"
 #include "NavigationSystem.h"
 
@@ -42,6 +43,23 @@ void OmniNavigation::CanonicalizeNativeSimpleLink(
         Swap(InOutLeft, InOutRight);
         InOutDirection = ENavLinkDirection::LeftToRight;
     }
+}
+
+void OmniNavigation::RefreshNativeLinkComponentNavigation(UNavLinkComponent& LinkComponent)
+{
+    if (!LinkComponent.IsRegistered() || !LinkComponent.GetWorld())
+    {
+        return;
+    }
+
+    // Omni mutates UNavLinkComponent::Links after the component may already have
+    // completed its native registration lifecycle. A component that registered
+    // while Links was empty can otherwise remain absent from the navigation octree
+    // after valid links are generated later. Re-register through Unreal's public
+    // runtime component API so empty -> valid, valid -> valid, and valid -> empty
+    // transitions all rebuild native navigation state consistently in editor and
+    // packaged game targets.
+    LinkComponent.ReregisterComponent();
 }
 
 void OmniNavigation::AppendSupportedAgentCompatibilityWarning(

@@ -2680,12 +2680,12 @@ bool AOmniSplineNavLink::CanRegenerateNow() const
 
 void AOmniSplineNavLink::NotifyNavigationSystem()
 {
-    if (!GeneratedLinks || !GeneratedLinks->IsRegistered() || !GeneratedLinks->GetWorld())
+    if (!GeneratedLinks)
     {
         return;
     }
 
-    FNavigationSystem::UpdateComponentData(*GeneratedLinks);
+    OmniNavigation::RefreshNativeLinkComponentNavigation(*GeneratedLinks);
 }
 
 void AOmniSplineNavLink::BindNavigationGenerationDelegate()

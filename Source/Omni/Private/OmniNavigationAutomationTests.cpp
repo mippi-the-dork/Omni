@@ -1,4 +1,5 @@
 #include "OmniPointNavLink.h"
+#include "OmniSplineNavLink.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
@@ -7,6 +8,7 @@
 #include "AI/NavigationSystemBase.h"
 #include "Builders/CubeBuilder.h"
 #include "Components/SphereComponent.h"
+#include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/CollisionProfile.h"
 #include "Engine/Engine.h"
@@ -24,12 +26,24 @@
 #include "NavMesh/RecastNavMesh.h"
 #include "NavigationData.h"
 #include "NavigationPath.h"
+#include "Navigation/NavLinkProxy.h"
 #include "NavigationSystem.h"
+#include "NavAreas/NavArea_Default.h"
 
 namespace OmniNavigationAutomation
 {
     constexpr double NavigationBuildTimeoutSeconds = 15.0;
     constexpr float TestTickSeconds = 1.0f / 60.0f;
+
+    void ConfigureStraightSpline(USplineComponent& Spline, const FVector& Center, float HalfLength = 40.0f)
+    {
+        Spline.SetRelativeLocation(FVector::ZeroVector);
+        Spline.ClearSplinePoints(false);
+        Spline.AddSplinePoint(Center + FVector(0.0, -HalfLength, 0.0), ESplineCoordinateSpace::World, false);
+        Spline.AddSplinePoint(Center + FVector(0.0, HalfLength, 0.0), ESplineCoordinateSpace::World, false);
+        Spline.SetClosedLoop(false, false);
+        Spline.UpdateSpline();
+    }
 
     class FScopedNavigationWorld
     {
@@ -256,6 +270,101 @@ namespace OmniNavigationAutomation
             return Point;
         }
 
+        AOmniSplineNavLink* AddSplineLink(
+            const FVector& SourceCenter,
+            const FVector& TargetCenter,
+            EOmniSplineLinkDirection Direction = EOmniSplineLinkDirection::BothWays)
+        {
+            if (!IsReady())
+            {
+                return nullptr;
+            }
+
+            const FTransform SpawnTransform = FTransform::Identity;
+            AOmniSplineNavLink* Spline = World->SpawnActorDeferred<AOmniSplineNavLink>(
+                AOmniSplineNavLink::StaticClass(),
+                SpawnTransform,
+                nullptr,
+                nullptr,
+                ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+            if (!Spline)
+            {
+                return nullptr;
+            }
+
+            Spline->SetFlags(RF_Transient);
+            Spline->bAutoRegenerate = false;
+            Spline->bRegenerateAfterNavigationBuild = false;
+            Spline->bEnabled = true;
+            Spline->TraversalAction = EOmniTraversalAction::NativeMovement;
+            Spline->bUseDirectionalTraversalActions = false;
+            Spline->LinkDirection = Direction;
+            Spline->PairingMode = EOmniPairingMode::Nearest;
+            Spline->CoverageDensity = EOmniCoverageDensity::Custom;
+            Spline->LinkSpacing = 200.0f;
+            Spline->MaximumLinkDistance = 0.0f;
+            Spline->bUseHeightLimits = false;
+            Spline->ProjectionExtent = FVector(75.0f, 75.0f, 200.0f);
+            Spline->MaximumProjectionDistance = 300.0f;
+            Spline->NativeProjectionHeight = 200.0f;
+            Spline->SnapRadius = 80.0f;
+            Spline->EndpointMergeDistance = 25.0f;
+            Spline->MaximumGeneratedLinks = 1;
+            Spline->SupportedAgents = SupportedAgentsMask;
+
+            ConfigureStraightSpline(*Spline->SourceSpline.Get(), SourceCenter);
+            ConfigureStraightSpline(*Spline->TargetSpline.Get(), TargetCenter);
+
+            // Finish spawning only after the authored spline geometry is in place.
+            // PreRegisterAllComponents intentionally clears GeneratedLinks, so
+            // PostRegisterAllComponents exercises the real empty-to-valid navigation
+            // relevance transition fixed by Omni's shared refresh path.
+            Spline->FinishSpawning(SpawnTransform);
+            return Spline;
+        }
+
+        ANavLinkProxy* AddNativePointLinkControl(
+            const FVector& Source,
+            const FVector& Target,
+            ENavLinkDirection::Type Direction = ENavLinkDirection::BothWays)
+        {
+            if (!IsReady())
+            {
+                return nullptr;
+            }
+
+            // Configure the native control before FinishSpawning so its first
+            // navigation registration already contains the intended simple link.
+            // This deliberately avoids depending on any post-registration update
+            // path while we validate the fixture itself.
+            FTransform SpawnTransform = FTransform::Identity;
+            ANavLinkProxy* Proxy = World->SpawnActorDeferred<ANavLinkProxy>(
+                ANavLinkProxy::StaticClass(),
+                SpawnTransform,
+                nullptr,
+                nullptr,
+                ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+            if (!Proxy)
+            {
+                return nullptr;
+            }
+
+            Proxy->SetFlags(RF_Transient);
+            Proxy->PointLinks.Reset();
+            FNavigationLink& Link = Proxy->PointLinks.Emplace_GetRef(Source, Target);
+            Link.Direction = Direction;
+            Link.SnapRadius = 80.0f;
+            Link.LeftProjectHeight = 200.0f;
+            Link.MaxFallDownLength = 200.0f;
+            Link.bUseSnapHeight = false;
+            Link.bSnapToCheapestArea = false;
+            Link.SupportedAgents = SupportedAgentsMask;
+            Link.SetAreaClass(UNavArea_Default::StaticClass());
+
+            Proxy->FinishSpawning(SpawnTransform);
+            return Proxy;
+        }
+
         bool BuildNavigation()
         {
             if (!IsReady())
@@ -434,27 +543,29 @@ namespace OmniNavigationAutomation
 
         bool SetupThreeIslandFixture()
         {
-            // Keep endpoint-regeneration geometry deliberately simple. The source
-            // island sits in the center with equal target islands to the left and
-            // right, so both the initial and regenerated native links are straight,
-            // horizontal connections of equal length. This isolates endpoint
-            // replacement from diagonal-link geometry and platform-shape variables.
-            if (!AddPlatform(FVector(0.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
+            // Keep endpoint-regeneration geometry deliberately simple and respect
+            // FNavigationLink::SnapRadius. The source island is intentionally narrow:
+            // its authored source point at X=0 is only 50 units from either island
+            // edge, remaining inside the 80-unit SnapRadius when the target moves
+            // from the right island to the left island. Each target endpoint is 25
+            // units inside its corresponding inner edge. This keeps both links
+            // straight, horizontal, equal-length, and attachable to Recast.
+            if (!AddPlatform(FVector(0.0, 0.0, -25.0), FVector(100.0, 500.0, 50.0)))
             {
                 Test.AddError(TEXT("Failed to create the source navigation platform."));
                 return false;
             }
-            if (!AddPlatform(FVector(500.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
+            if (!AddPlatform(FVector(400.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
             {
                 Test.AddError(TEXT("Failed to create target navigation platform A."));
                 return false;
             }
-            if (!AddPlatform(FVector(-500.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
+            if (!AddPlatform(FVector(-400.0, 0.0, -25.0), FVector(300.0, 500.0, 50.0)))
             {
                 Test.AddError(TEXT("Failed to create target navigation platform B."));
                 return false;
             }
-            if (!AddNavigationBounds(FVector::ZeroVector, FVector(1400.0, 900.0, 600.0)))
+            if (!AddNavigationBounds(FVector::ZeroVector, FVector(1200.0, 900.0, 600.0)))
             {
                 Test.AddError(TEXT("Failed to create the transient NavMesh Bounds Volume."));
                 return false;
@@ -465,8 +576,8 @@ namespace OmniNavigationAutomation
             }
 
             const FVector SourceProbe(0.0, 0.0, 20.0);
-            const FVector TargetAProbe(500.0, 0.0, 20.0);
-            const FVector TargetBProbe(-500.0, 0.0, 20.0);
+            const FVector TargetAProbe(400.0, 0.0, 20.0);
+            const FVector TargetBProbe(-400.0, 0.0, 20.0);
             if (!ProjectsToNavigation(SourceProbe)
                 || !ProjectsToNavigation(TargetAProbe)
                 || !ProjectsToNavigation(TargetBProbe))
@@ -477,9 +588,9 @@ namespace OmniNavigationAutomation
 
             // Projection alone is not enough proof. Require a complete path within
             // every island before the fixture can be used to judge an Omni link.
-            if (!HasCompletePath(FVector(-100.0, 0.0, 20.0), FVector(100.0, 0.0, 20.0))
-                || !HasCompletePath(FVector(400.0, 0.0, 20.0), FVector(600.0, 0.0, 20.0))
-                || !HasCompletePath(FVector(-600.0, 0.0, 20.0), FVector(-400.0, 0.0, 20.0)))
+            if (!HasCompletePath(FVector(-20.0, 0.0, 20.0), FVector(20.0, 0.0, 20.0))
+                || !HasCompletePath(FVector(300.0, 0.0, 20.0), FVector(500.0, 0.0, 20.0))
+                || !HasCompletePath(FVector(-500.0, 0.0, 20.0), FVector(-300.0, 0.0, 20.0)))
             {
                 Test.AddError(TEXT("Transient three-island Recast fixture could not path within one or more individual test platforms."));
                 return false;
@@ -673,6 +784,47 @@ bool FOmniNavigationPointDisableRemovesPathTest::RunTest(const FString& Paramete
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationPointThreeIslandNativeControlTest,
+    "Omni.Navigation.Point.ThreeIslandNativeControl",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationPointThreeIslandNativeControlTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupThreeIslandFixture())
+    {
+        return false;
+    }
+
+    const FVector SourceQuery(0.0, 0.0, 20.0);
+    const FVector TargetAQuery(400.0, 0.0, 20.0);
+    const FVector TargetBQuery(-400.0, 0.0, 20.0);
+    const FVector SourceEndpoint(0.0, 0.0, 20.0);
+    const FVector TargetAEndpoint(275.0, 0.0, 20.0);
+
+    TestFalse(TEXT("Native-control source cannot initially reach target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestFalse(TEXT("Native-control source cannot initially reach target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+
+    ANavLinkProxy* NativeProxy = TestWorld.AddNativePointLinkControl(
+        SourceEndpoint,
+        TargetAEndpoint,
+        ENavLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Native NavLinkProxy control"), NativeProxy))
+    {
+        return false;
+    }
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Native NavLinkProxy connects source to target A in the three-island fixture"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestFalse(TEXT("Native NavLinkProxy does not connect source to untouched target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FOmniNavigationPointEndpointRegenerationTest,
     "Omni.Navigation.Point.EndpointRegeneration",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -686,11 +838,11 @@ bool FOmniNavigationPointEndpointRegenerationTest::RunTest(const FString& Parame
     }
 
     const FVector SourceQuery(0.0, 0.0, 20.0);
-    const FVector TargetAQuery(500.0, 0.0, 20.0);
-    const FVector TargetBQuery(-500.0, 0.0, 20.0);
+    const FVector TargetAQuery(400.0, 0.0, 20.0);
+    const FVector TargetBQuery(-400.0, 0.0, 20.0);
     const FVector SourceEndpoint(0.0, 0.0, 20.0);
-    const FVector TargetAEndpoint(400.0, 0.0, 20.0);
-    const FVector TargetBEndpoint(-400.0, 0.0, 20.0);
+    const FVector TargetAEndpoint(275.0, 0.0, 20.0);
+    const FVector TargetBEndpoint(-275.0, 0.0, 20.0);
 
     TestFalse(TEXT("Source cannot initially reach target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
     TestFalse(TEXT("Source cannot initially reach target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
@@ -701,6 +853,35 @@ bool FOmniNavigationPointEndpointRegenerationTest::RunTest(const FString& Parame
         return false;
     }
     TestEqual(TEXT("Initial endpoint produces one native link"), Point->NativeLinkCount, 1);
+    if (!TestNotNull(TEXT("Omni generated UNavLinkComponent"), Point->GeneratedLinks.Get()))
+    {
+        return false;
+    }
+    TestTrue(TEXT("Omni generated link component is registered"), Point->GeneratedLinks->IsRegistered());
+    TestTrue(TEXT("Omni generated link component reports navigation relevance"), Point->GeneratedLinks->IsNavigationRelevant());
+    TestEqual(TEXT("Omni generated link component contains one FNavigationLink"), Point->GeneratedLinks->Links.Num(), 1);
+
+    if (Point->GeneratedLinks->Links.Num() == 1)
+    {
+        const FNavigationLink& GeneratedLink = Point->GeneratedLinks->Links[0];
+        const FTransform LinkTransform = Point->GeneratedLinks->GetComponentTransform();
+        const FVector GeneratedLeftWorld = LinkTransform.TransformPosition(GeneratedLink.Left);
+        const FVector GeneratedRightWorld = LinkTransform.TransformPosition(GeneratedLink.Right);
+
+        AddInfo(FString::Printf(
+            TEXT("Omni generated link | Left=%s | Right=%s | Direction=%d | SnapRadius=%.2f | LeftProjectHeight=%.2f | BoundsOrigin=%s | BoundsExtent=%s"),
+            *GeneratedLeftWorld.ToCompactString(),
+            *GeneratedRightWorld.ToCompactString(),
+            static_cast<int32>(GeneratedLink.Direction),
+            GeneratedLink.SnapRadius,
+            GeneratedLink.LeftProjectHeight,
+            *Point->GeneratedLinks->Bounds.Origin.ToCompactString(),
+            *Point->GeneratedLinks->Bounds.BoxExtent.ToCompactString()));
+
+        TestTrue(TEXT("Generated native link left endpoint projects to navigation"), TestWorld.ProjectsToNavigation(GeneratedLeftWorld));
+        TestTrue(TEXT("Generated native link right endpoint projects to navigation"), TestWorld.ProjectsToNavigation(GeneratedRightWorld));
+    }
+
     if (!TestWorld.BuildNavigation())
     {
         return false;
@@ -719,6 +900,220 @@ bool FOmniNavigationPointEndpointRegenerationTest::RunTest(const FString& Parame
 
     TestFalse(TEXT("Old target A connection is removed after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
     TestTrue(TEXT("New target B connection is available after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+    return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationSplineBaselineDisconnectedTest,
+    "Omni.Navigation.Spline.BaselineDisconnected",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationSplineBaselineDisconnectedTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    TestFalse(
+        TEXT("Separated platform islands have no complete native path before an Omni Spline is added"),
+        TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationSplineNativeBothWaysTest,
+    "Omni.Navigation.Spline.NativeBothWays",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationSplineNativeBothWaysTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniSplineLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Spline"), Spline))
+    {
+        return false;
+    }
+    TestEqual(TEXT("Omni Spline generated one native link"), Spline->NativeLinkCount, 1);
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Spline Source to Target path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Spline Target to Source path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationSplineSourceToTargetTest,
+    "Omni.Navigation.Spline.SourceToTarget",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationSplineSourceToTargetTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniSplineLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Spline"), Spline) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Spline Source to Target path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Spline Target to Source path is rejected"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationSplineTargetToSourceTest,
+    "Omni.Navigation.Spline.TargetToSource",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationSplineTargetToSourceTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniSplineLinkDirection::TargetToSource);
+    if (!TestNotNull(TEXT("Omni Spline"), Spline))
+    {
+        return false;
+    }
+    if (!TestEqual(TEXT("Omni Spline generated one reverse native link"), Spline->NativeLinkCount, 1))
+    {
+        return false;
+    }
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Spline Source to Target path is rejected"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Spline Target to Source path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationSplineDisableRemovesPathTest,
+    "Omni.Navigation.Spline.DisableRemovesPath",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationSplineDisableRemovesPathTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniSplineLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Spline"), Spline) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Enabled Omni Spline provides a complete path"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+
+    Spline->bEnabled = false;
+    Spline->RegenerateLinks();
+    TestEqual(TEXT("Disabling Omni Spline removes generated native links"), Spline->NativeLinkCount, 0);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+    TestFalse(TEXT("Disabled Omni Spline no longer provides a complete path"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+
+    Spline->bEnabled = true;
+    Spline->RegenerateLinks();
+    TestEqual(TEXT("Re-enabling Omni Spline restores its generated native link"), Spline->NativeLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+    TestTrue(TEXT("Re-enabled Omni Spline restores the complete path"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationSplineEndpointRegenerationTest,
+    "Omni.Navigation.Spline.EndpointRegeneration",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationSplineEndpointRegenerationTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupThreeIslandFixture())
+    {
+        return false;
+    }
+
+    const FVector SourceQuery(0.0, 0.0, 20.0);
+    const FVector TargetAQuery(400.0, 0.0, 20.0);
+    const FVector TargetBQuery(-400.0, 0.0, 20.0);
+    const FVector SourceSplineCenter(0.0, 0.0, 20.0);
+    const FVector TargetASplineCenter(275.0, 0.0, 20.0);
+    const FVector TargetBSplineCenter(-275.0, 0.0, 20.0);
+
+    TestFalse(TEXT("Spline source cannot initially reach target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestFalse(TEXT("Spline source cannot initially reach target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        SourceSplineCenter,
+        TargetASplineCenter,
+        EOmniSplineLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Spline"), Spline))
+    {
+        return false;
+    }
+    TestEqual(TEXT("Initial Spline geometry produces one native link"), Spline->NativeLinkCount, 1);
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Initial Spline geometry connects target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestFalse(TEXT("Initial Spline geometry does not connect target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+
+    OmniNavigationAutomation::ConfigureStraightSpline(*Spline->TargetSpline.Get(), TargetBSplineCenter);
+    Spline->RegenerateLinks();
+    TestEqual(TEXT("Regenerated Spline geometry still produces one native link"), Spline->NativeLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Old Spline target A connection is removed after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestTrue(TEXT("New Spline target B connection is available after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
     return true;
 }
 
