@@ -1,5 +1,6 @@
 #include "OmniPointNavLink.h"
 #include "OmniSplineNavLink.h"
+#include "OmniVolumeNavLink.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
@@ -7,6 +8,7 @@
 #include "AI/Navigation/NavigationTypes.h"
 #include "AI/NavigationSystemBase.h"
 #include "Builders/CubeBuilder.h"
+#include "Components/BoxComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -29,6 +31,7 @@
 #include "Navigation/NavLinkProxy.h"
 #include "NavigationSystem.h"
 #include "NavAreas/NavArea_Default.h"
+#include "UObject/UObjectGlobals.h"
 
 namespace OmniNavigationAutomation
 {
@@ -45,11 +48,97 @@ namespace OmniNavigationAutomation
         Spline.UpdateSpline();
     }
 
+    void ConfigureVolumeBox(UBoxComponent& Box, const FVector& Center, const FVector& Extent)
+    {
+        Box.SetWorldLocation(Center);
+        Box.SetWorldRotation(FRotator::ZeroRotator);
+        Box.SetWorldScale3D(FVector::OneVector);
+        Box.SetBoxExtent(Extent);
+        Box.UpdateBounds();
+    }
+
+    class FScopedDefaultSupportedAgentsOverride
+    {
+    public:
+        explicit FScopedDefaultSupportedAgentsOverride(FAutomationTestBase& InTest, bool bEnable)
+            : Test(InTest)
+        {
+            if (!bEnable)
+            {
+                return;
+            }
+
+            NavigationSystemDefaults = GetMutableDefault<UNavigationSystemV1>();
+            if (!NavigationSystemDefaults)
+            {
+                Test.AddError(TEXT("Could not access UNavigationSystemV1 class defaults for the multi-agent Omni fixture."));
+                return;
+            }
+
+            OriginalAgents = NavigationSystemDefaults->GetSupportedAgents();
+
+            FNavDataConfig AgentA = UNavigationSystemV1::GetDefaultSupportedAgent();
+            AgentA.Name = TEXT("OmniAgentA");
+            AgentA.AgentRadius = 10.0f;
+            AgentA.AgentHeight = 100.0f;
+            AgentA.SetNavDataClass(ARecastNavMesh::StaticClass());
+
+            FNavDataConfig AgentB = AgentA;
+            AgentB.Name = TEXT("OmniAgentB");
+            AgentB.AgentRadius = 20.0f;
+            AgentB.AgentHeight = 120.0f;
+
+            TArray<FNavDataConfig> TestAgents;
+            TestAgents.Add(AgentA);
+            TestAgents.Add(AgentB);
+
+            // Supported Agents are project-level UNavigationSystemV1 config.
+            // Override the class defaults before the synthetic world's Navigation
+            // System instance is created so the instance inherits the two-agent
+            // configuration through Unreal's normal construction/DoInitialSetup path.
+            // Do not SaveConfig(); this is an in-memory automation-only override.
+            NavigationSystemDefaults->OverrideSupportedAgents(TestAgents);
+            bApplied = NavigationSystemDefaults->GetSupportedAgents().Num() == 2;
+            if (!bApplied)
+            {
+                Test.AddError(FString::Printf(
+                    TEXT("Multi-agent Omni fixture could not install two agents on UNavigationSystemV1 class defaults; found %d."),
+                    NavigationSystemDefaults->GetSupportedAgents().Num()));
+            }
+        }
+
+        ~FScopedDefaultSupportedAgentsOverride()
+        {
+            Restore();
+        }
+
+        bool WasApplied() const
+        {
+            return bApplied;
+        }
+
+        void Restore()
+        {
+            if (bApplied && NavigationSystemDefaults)
+            {
+                NavigationSystemDefaults->OverrideSupportedAgents(OriginalAgents);
+                bApplied = false;
+            }
+        }
+
+    private:
+        FAutomationTestBase& Test;
+        UNavigationSystemV1* NavigationSystemDefaults = nullptr;
+        TArray<FNavDataConfig> OriginalAgents;
+        bool bApplied = false;
+    };
+
     class FScopedNavigationWorld
     {
     public:
-        explicit FScopedNavigationWorld(FAutomationTestBase& InTest)
+        explicit FScopedNavigationWorld(FAutomationTestBase& InTest, bool bInConfigureTwoAgents = false)
             : Test(InTest)
+            , bConfigureTwoAgents(bInConfigureTwoAgents)
         {
             static int32 WorldCounter = 0;
             const FName WorldName(*FString::Printf(TEXT("OmniNavigationAutomationWorld_%d"), ++WorldCounter));
@@ -70,6 +159,12 @@ namespace OmniNavigationAutomation
             if (!GEditor)
             {
                 Test.AddError(TEXT("GEditor is unavailable while creating the Omni navigation automation world."));
+                return;
+            }
+
+            FScopedDefaultSupportedAgentsOverride DefaultAgentsOverride(Test, bConfigureTwoAgents);
+            if (bConfigureTwoAgents && !DefaultAgentsOverride.WasApplied())
+            {
                 return;
             }
 
@@ -132,6 +227,30 @@ namespace OmniNavigationAutomation
                 return;
             }
 
+            if (bConfigureTwoAgents)
+            {
+                // The per-world instance has now inherited the temporary class-default
+                // configuration through Unreal's normal initialization path. Restore the
+                // project defaults immediately so this synthetic fixture cannot leak its
+                // two-agent setup into later editor work or automation tests.
+                DefaultAgentsOverride.Restore();
+
+                if (NavigationSystem->GetSupportedAgents().Num() != 2)
+                {
+                    Test.AddError(FString::Printf(
+                        TEXT("Multi-agent Omni fixture expected exactly two supported agents after InitializeForWorld(), but found %d."),
+                        NavigationSystem->GetSupportedAgents().Num()));
+                    return;
+                }
+
+                FNavAgentSelector TwoAgentMask;
+                TwoAgentMask.Empty();
+                TwoAgentMask.Set(0);
+                TwoAgentMask.Set(1);
+                TwoAgentMask.MarkInitialized();
+                NavigationSystem->SetSupportedAgentsMask(TwoAgentMask);
+            }
+
             if (NavigationSystem->GetSupportedAgents().IsEmpty())
             {
                 Test.AddError(TEXT("Transient Omni navigation system has no supported navigation agents."));
@@ -172,6 +291,23 @@ namespace OmniNavigationAutomation
         UWorld* GetWorld() const
         {
             return World;
+        }
+
+        FNavAgentSelector GetAgentMask(int32 AgentIndex) const
+        {
+            FNavAgentSelector Mask;
+            Mask.Empty();
+            if (AgentIndex >= 0 && AgentIndex < FNavAgentSelector::AgentsMaxCount)
+            {
+                Mask.Set(AgentIndex);
+            }
+            Mask.MarkInitialized();
+            return Mask;
+        }
+
+        const FNavAgentSelector& GetSupportedAgentsMask() const
+        {
+            return SupportedAgentsMask;
         }
 
         AStaticMeshActor* AddPlatform(const FVector& Center, const FVector& Size)
@@ -238,7 +374,8 @@ namespace OmniNavigationAutomation
         AOmniPointNavLink* AddPointLink(
             const FVector& Source,
             const FVector& Target,
-            EOmniPointLinkDirection Direction = EOmniPointLinkDirection::BothWays)
+            EOmniPointLinkDirection Direction = EOmniPointLinkDirection::BothWays,
+            const FNavAgentSelector* SupportedAgentsOverride = nullptr)
         {
             if (!IsReady())
             {
@@ -263,7 +400,7 @@ namespace OmniNavigationAutomation
             Point->bUseHeightLimits = false;
             Point->NativeProjectionHeight = 200.0f;
             Point->SnapRadius = 80.0f;
-            Point->SupportedAgents = SupportedAgentsMask;
+            Point->SupportedAgents = SupportedAgentsOverride ? *SupportedAgentsOverride : SupportedAgentsMask;
             Point->SourcePoint->SetWorldLocation(Source);
             Point->TargetPoint->SetWorldLocation(Target);
             Point->RegenerateLink();
@@ -273,7 +410,8 @@ namespace OmniNavigationAutomation
         AOmniSplineNavLink* AddSplineLink(
             const FVector& SourceCenter,
             const FVector& TargetCenter,
-            EOmniSplineLinkDirection Direction = EOmniSplineLinkDirection::BothWays)
+            EOmniSplineLinkDirection Direction = EOmniSplineLinkDirection::BothWays,
+            const FNavAgentSelector* SupportedAgentsOverride = nullptr)
         {
             if (!IsReady())
             {
@@ -310,17 +448,86 @@ namespace OmniNavigationAutomation
             Spline->SnapRadius = 80.0f;
             Spline->EndpointMergeDistance = 25.0f;
             Spline->MaximumGeneratedLinks = 1;
-            Spline->SupportedAgents = SupportedAgentsMask;
+            Spline->SupportedAgents = SupportedAgentsOverride ? *SupportedAgentsOverride : SupportedAgentsMask;
 
             ConfigureStraightSpline(*Spline->SourceSpline.Get(), SourceCenter);
             ConfigureStraightSpline(*Spline->TargetSpline.Get(), TargetCenter);
 
-            // Finish spawning only after the authored spline geometry is in place.
-            // PreRegisterAllComponents intentionally clears GeneratedLinks, so
-            // PostRegisterAllComponents exercises the real empty-to-valid navigation
-            // relevance transition fixed by Omni's shared refresh path.
+            // SpawnActorDeferred still registers native components before returning,
+            // so PostRegisterAllComponents may already have generated links from the
+            // constructor-default splines. Because this fixture disables automatic
+            // regeneration, explicitly finalize the authored state after FinishSpawning.
+            // Clear through the public Omni lifecycle first, then regenerate, so the
+            // test still exercises the empty-to-valid native navigation transition.
             Spline->FinishSpawning(SpawnTransform);
+            Spline->bEnabled = false;
+            Spline->RegenerateLinks();
+            Spline->bEnabled = true;
+            Spline->RegenerateLinks();
             return Spline;
+        }
+
+        AOmniVolumeNavLink* AddVolumeLink(
+            const FVector& SourceCenter,
+            const FVector& TargetCenter,
+            EOmniVolumeLinkDirection Direction = EOmniVolumeLinkDirection::BothWays,
+            int32 MaximumLinks = 1,
+            const FVector& BoxExtent = FVector(20.0f, 20.0f, 75.0f),
+            float Spacing = 200.0f,
+            const FNavAgentSelector* SupportedAgentsOverride = nullptr)
+        {
+            if (!IsReady())
+            {
+                return nullptr;
+            }
+
+            const FTransform SpawnTransform = FTransform::Identity;
+            AOmniVolumeNavLink* Volume = World->SpawnActorDeferred<AOmniVolumeNavLink>(
+                AOmniVolumeNavLink::StaticClass(),
+                SpawnTransform,
+                nullptr,
+                nullptr,
+                ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+            if (!Volume)
+            {
+                return nullptr;
+            }
+
+            Volume->SetFlags(RF_Transient);
+            Volume->bAutoRegenerate = false;
+            Volume->bRegenerateAfterNavigationBuild = false;
+            Volume->bEnabled = true;
+            Volume->TraversalAction = EOmniTraversalAction::NativeMovement;
+            Volume->bUseDirectionalTraversalActions = false;
+            Volume->LinkDirection = Direction;
+            Volume->PairingMode = EOmniPairingMode::Nearest;
+            Volume->CoverageDensity = EOmniCoverageDensity::Custom;
+            Volume->LinkSpacing = Spacing;
+            Volume->MaximumLinkDistance = 0.0f;
+            Volume->bUseHeightLimits = false;
+            Volume->ProjectionExtent = FVector(75.0f, 75.0f, 200.0f);
+            Volume->ProjectionContainmentTolerance = 25.0f;
+            Volume->MaximumProjectionDistance = 300.0f;
+            Volume->NativeProjectionHeight = 200.0f;
+            Volume->SnapRadius = 80.0f;
+            Volume->EndpointMergeDistance = 25.0f;
+            Volume->MaximumGridSamplesPerVolume = 64;
+            Volume->MaximumGeneratedLinks = FMath::Clamp(MaximumLinks, 1, 1024);
+            Volume->SupportedAgents = SupportedAgentsOverride ? *SupportedAgentsOverride : SupportedAgentsMask;
+
+            ConfigureVolumeBox(*Volume->SourceBox.Get(), SourceCenter, BoxExtent);
+            ConfigureVolumeBox(*Volume->TargetBox.Get(), TargetCenter, BoxExtent);
+
+            // Match the Spline fixture's lifecycle discipline. Deferred spawning can
+            // register native components before FinishSpawning(), so explicitly clear
+            // any constructor-default derived output and regenerate from the final
+            // authored boxes. This preserves empty-to-valid registration coverage.
+            Volume->FinishSpawning(SpawnTransform);
+            Volume->bEnabled = false;
+            Volume->RegenerateLinks();
+            Volume->bEnabled = true;
+            Volume->RegenerateLinks();
+            return Volume;
         }
 
         ANavLinkProxy* AddNativePointLinkControl(
@@ -412,12 +619,50 @@ namespace OmniNavigationAutomation
             // as RegistrationFailed_AgentNotValid. If actor initialization did not
             // already create a valid default NavData, construct Recast from the exact
             // default supported-agent config instead.
-            NavData = NavigationSystem->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
-            if (!NavData)
+            AgentNavData.Reset();
+            if (bConfigureTwoAgents)
             {
-                FNavDataConfig RecastConfig = NavigationSystem->GetDefaultSupportedAgentConfig();
-                RecastConfig.SetNavDataClass(ARecastNavMesh::StaticClass());
-                NavData = NavigationSystem->CreateNavigationDataInstanceInLevel(RecastConfig, World->PersistentLevel);
+                const TArray<FNavDataConfig>& SupportedAgents = NavigationSystem->GetSupportedAgents();
+                AgentNavData.SetNumZeroed(SupportedAgents.Num());
+                for (int32 AgentIndex = 0; AgentIndex < SupportedAgents.Num(); ++AgentIndex)
+                {
+                    if (!SupportedAgentsMask.Contains(AgentIndex))
+                    {
+                        continue;
+                    }
+
+                    const FNavDataConfig& AgentConfig = SupportedAgents[AgentIndex];
+                    ANavigationData* AgentData = NavigationSystem->GetNavDataForAgentName(AgentConfig.Name);
+                    if (!AgentData)
+                    {
+                        FNavDataConfig RecastConfig = AgentConfig;
+                        RecastConfig.SetNavDataClass(ARecastNavMesh::StaticClass());
+                        AgentData = NavigationSystem->CreateNavigationDataInstanceInLevel(RecastConfig, World->PersistentLevel);
+                    }
+
+                    if (!AgentData)
+                    {
+                        Test.AddError(FString::Printf(
+                            TEXT("Failed to create Recast navigation data for supported agent %d (%s)."),
+                            AgentIndex,
+                            *AgentConfig.Name.ToString()));
+                        return false;
+                    }
+
+                    AgentNavData[AgentIndex] = AgentData;
+                }
+
+                NavData = AgentNavData.IsValidIndex(0) ? AgentNavData[0] : nullptr;
+            }
+            else
+            {
+                NavData = NavigationSystem->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
+                if (!NavData)
+                {
+                    FNavDataConfig RecastConfig = NavigationSystem->GetDefaultSupportedAgentConfig();
+                    RecastConfig.SetNavDataClass(ARecastNavMesh::StaticClass());
+                    NavData = NavigationSystem->CreateNavigationDataInstanceInLevel(RecastConfig, World->PersistentLevel);
+                }
             }
 
             if (!NavData)
@@ -452,17 +697,59 @@ namespace OmniNavigationAutomation
                 return false;
             }
 
-            NavData = NavigationSystem->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
-            if (!NavData)
+            if (bConfigureTwoAgents)
             {
-                Test.AddError(TEXT("Omni navigation automation world has no default navigation data after Build()."));
-                return false;
-            }
+                const TArray<FNavDataConfig>& SupportedAgents = NavigationSystem->GetSupportedAgents();
+                for (int32 AgentIndex = 0; AgentIndex < SupportedAgents.Num(); ++AgentIndex)
+                {
+                    if (!SupportedAgentsMask.Contains(AgentIndex))
+                    {
+                        continue;
+                    }
 
-            if (NavigationSystem->GetSupportedAgentIndex(NavData) == INDEX_NONE)
+                    ANavigationData* AgentData = NavigationSystem->GetNavDataForAgentName(SupportedAgents[AgentIndex].Name);
+                    if (!AgentData && AgentNavData.IsValidIndex(AgentIndex))
+                    {
+                        AgentData = AgentNavData[AgentIndex];
+                    }
+
+                    if (!AgentData)
+                    {
+                        Test.AddError(FString::Printf(
+                            TEXT("Multi-agent Omni fixture has no NavData for supported agent %d after Build()."),
+                            AgentIndex));
+                        return false;
+                    }
+
+                    const int32 RegisteredAgentIndex = NavigationSystem->GetSupportedAgentIndex(AgentData);
+                    if (RegisteredAgentIndex != AgentIndex)
+                    {
+                        Test.AddError(FString::Printf(
+                            TEXT("Multi-agent Omni fixture NavData for index %d registered as agent %d."),
+                            AgentIndex,
+                            RegisteredAgentIndex));
+                        return false;
+                    }
+
+                    AgentNavData[AgentIndex] = AgentData;
+                }
+
+                NavData = AgentNavData.IsValidIndex(0) ? AgentNavData[0] : nullptr;
+            }
+            else
             {
-                Test.AddError(TEXT("Omni navigation automation NavData does not match any supported navigation agent."));
-                return false;
+                NavData = NavigationSystem->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
+                if (!NavData)
+                {
+                    Test.AddError(TEXT("Omni navigation automation world has no default navigation data after Build()."));
+                    return false;
+                }
+
+                if (NavigationSystem->GetSupportedAgentIndex(NavData) == INDEX_NONE)
+                {
+                    Test.AddError(TEXT("Omni navigation automation NavData does not match any supported navigation agent."));
+                    return false;
+                }
             }
 
             return true;
@@ -470,35 +757,24 @@ namespace OmniNavigationAutomation
 
         bool HasCompletePath(const FVector& Start, const FVector& End) const
         {
-            if (!World || !NavData)
-            {
-                return false;
-            }
+            return HasCompletePathWithNavData(NavData, Start, End);
+        }
 
-            UNavigationPath* Path = UNavigationSystemV1::FindPathToLocationSynchronously(
-                World,
-                Start,
-                End,
-                NavData,
-                nullptr);
-
-            return Path && Path->IsValid() && !Path->IsPartial();
+        bool HasCompletePathForAgent(int32 AgentIndex, const FVector& Start, const FVector& End) const
+        {
+            return AgentNavData.IsValidIndex(AgentIndex)
+                && HasCompletePathWithNavData(AgentNavData[AgentIndex], Start, End);
         }
 
         bool ProjectsToNavigation(const FVector& Point) const
         {
-            if (!NavigationSystem || !NavData)
-            {
-                return false;
-            }
+            return ProjectsToNavigationWithNavData(NavData, Point);
+        }
 
-            FNavLocation ProjectedLocation;
-            return NavigationSystem->ProjectPointToNavigation(
-                Point,
-                ProjectedLocation,
-                FVector(100.0, 100.0, 250.0),
-                NavData,
-                nullptr);
+        bool ProjectsToNavigationForAgent(int32 AgentIndex, const FVector& Point) const
+        {
+            return AgentNavData.IsValidIndex(AgentIndex)
+                && ProjectsToNavigationWithNavData(AgentNavData[AgentIndex], Point);
         }
 
         bool SetupTwoIslandFixture()
@@ -599,15 +875,95 @@ namespace OmniNavigationAutomation
             return true;
         }
 
+        bool SetupTwoAgentTwoIslandFixture()
+        {
+            if (!bConfigureTwoAgents)
+            {
+                Test.AddError(TEXT("Two-agent navigation fixture requested without multi-agent configuration."));
+                return false;
+            }
+
+            if (!AddPlatform(FVector(-450.0, 0.0, -25.0), FVector(600.0, 600.0, 50.0))
+                || !AddPlatform(FVector(450.0, 0.0, -25.0), FVector(600.0, 600.0, 50.0)))
+            {
+                Test.AddError(TEXT("Failed to create one or both multi-agent navigation platforms."));
+                return false;
+            }
+
+            if (!AddNavigationBounds(FVector::ZeroVector, FVector(1800.0, 1200.0, 600.0))
+                || !BuildNavigation())
+            {
+                return false;
+            }
+
+            for (int32 AgentIndex = 0; AgentIndex < 2; ++AgentIndex)
+            {
+                if (!ProjectsToNavigationForAgent(AgentIndex, FVector(-450.0, 0.0, 20.0))
+                    || !ProjectsToNavigationForAgent(AgentIndex, FVector(450.0, 0.0, 20.0)))
+                {
+                    Test.AddError(FString::Printf(
+                        TEXT("Multi-agent Recast fixture did not project both islands for agent %d."),
+                        AgentIndex));
+                    return false;
+                }
+
+                if (!HasCompletePathForAgent(AgentIndex, FVector(-650.0, 0.0, 20.0), FVector(-250.0, 0.0, 20.0))
+                    || !HasCompletePathForAgent(AgentIndex, FVector(250.0, 0.0, 20.0), FVector(650.0, 0.0, 20.0)))
+                {
+                    Test.AddError(FString::Printf(
+                        TEXT("Multi-agent Recast fixture could not path within both islands for agent %d."),
+                        AgentIndex));
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
     private:
+        bool HasCompletePathWithNavData(ANavigationData* InNavData, const FVector& Start, const FVector& End) const
+        {
+            if (!World || !InNavData)
+            {
+                return false;
+            }
+
+            UNavigationPath* Path = UNavigationSystemV1::FindPathToLocationSynchronously(
+                World,
+                Start,
+                End,
+                InNavData,
+                nullptr);
+
+            return Path && Path->IsValid() && !Path->IsPartial();
+        }
+
+        bool ProjectsToNavigationWithNavData(ANavigationData* InNavData, const FVector& Point) const
+        {
+            if (!NavigationSystem || !InNavData)
+            {
+                return false;
+            }
+
+            FNavLocation ProjectedLocation;
+            return NavigationSystem->ProjectPointToNavigation(
+                Point,
+                ProjectedLocation,
+                FVector(100.0, 100.0, 250.0),
+                InNavData,
+                nullptr);
+        }
+
         FAutomationTestBase& Test;
         TUniquePtr<FScopedEditorWorld> EditorWorldScope;
         UWorld* World = nullptr;
         UNavigationSystemV1* NavigationSystem = nullptr;
         ANavigationData* NavData = nullptr;
+        TArray<ANavigationData*> AgentNavData;
         UStaticMesh* CubeMesh = nullptr;
         FNavAgentSelector SupportedAgentsMask;
         bool bNavigationActorsInitialized = false;
+        bool bConfigureTwoAgents = false;
     };
 
     const FVector LeftQuery(-450.0, 0.0, 20.0);
@@ -1114,6 +1470,429 @@ bool FOmniNavigationSplineEndpointRegenerationTest::RunTest(const FString& Param
 
     TestFalse(TEXT("Old Spline target A connection is removed after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
     TestTrue(TEXT("New Spline target B connection is available after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+    return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeBaselineDisconnectedTest,
+    "Omni.Navigation.Volume.BaselineDisconnected",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeBaselineDisconnectedTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    TestFalse(
+        TEXT("Separated platform islands have no complete native path before an Omni Volume is added"),
+        TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeNativeBothWaysTest,
+    "Omni.Navigation.Volume.NativeBothWays",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeNativeBothWaysTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniVolumeLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Volume"), Volume))
+    {
+        return false;
+    }
+    TestEqual(TEXT("Omni Volume generated one native link"), Volume->NativeLinkCount, 1);
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Volume Source to Target path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Volume Target to Source path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeSourceToTargetTest,
+    "Omni.Navigation.Volume.SourceToTarget",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeSourceToTargetTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniVolumeLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Volume"), Volume) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Volume Source to Target path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Volume Target to Source path is rejected"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeTargetToSourceTest,
+    "Omni.Navigation.Volume.TargetToSource",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeTargetToSourceTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniVolumeLinkDirection::TargetToSource);
+    if (!TestNotNull(TEXT("Omni Volume"), Volume))
+    {
+        return false;
+    }
+    if (!TestEqual(TEXT("Omni Volume generated one reverse native link"), Volume->NativeLinkCount, 1))
+    {
+        return false;
+    }
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Volume Source to Target path is rejected"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Volume Target to Source path succeeds"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeDisableRemovesPathTest,
+    "Omni.Navigation.Volume.DisableRemovesPath",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeDisableRemovesPathTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniVolumeLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Volume"), Volume) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Enabled Omni Volume provides a complete path"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+
+    Volume->bEnabled = false;
+    Volume->RegenerateLinks();
+    TestEqual(TEXT("Disabling Omni Volume removes generated native links"), Volume->NativeLinkCount, 0);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+    TestFalse(TEXT("Disabled Omni Volume no longer provides a complete path"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+
+    Volume->bEnabled = true;
+    Volume->RegenerateLinks();
+    TestEqual(TEXT("Re-enabling Omni Volume restores its generated native link"), Volume->NativeLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+    TestTrue(TEXT("Re-enabled Omni Volume restores the complete path"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeEndpointRegenerationTest,
+    "Omni.Navigation.Volume.EndpointRegeneration",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeEndpointRegenerationTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupThreeIslandFixture())
+    {
+        return false;
+    }
+
+    const FVector SourceQuery(0.0, 0.0, 20.0);
+    const FVector TargetAQuery(400.0, 0.0, 20.0);
+    const FVector TargetBQuery(-400.0, 0.0, 20.0);
+    const FVector SourceVolumeCenter(0.0, 0.0, 20.0);
+    const FVector TargetAVolumeCenter(275.0, 0.0, 20.0);
+    const FVector TargetBVolumeCenter(-275.0, 0.0, 20.0);
+
+    TestFalse(TEXT("Volume source cannot initially reach target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestFalse(TEXT("Volume source cannot initially reach target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        SourceVolumeCenter,
+        TargetAVolumeCenter,
+        EOmniVolumeLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Volume"), Volume))
+    {
+        return false;
+    }
+    TestEqual(TEXT("Initial Volume geometry produces one native link"), Volume->NativeLinkCount, 1);
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Initial Volume geometry connects target A"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestFalse(TEXT("Initial Volume geometry does not connect target B"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+
+    OmniNavigationAutomation::ConfigureVolumeBox(*Volume->TargetBox.Get(), TargetBVolumeCenter, FVector(20.0f, 20.0f, 75.0f));
+    Volume->RegenerateLinks();
+    TestEqual(TEXT("Regenerated Volume geometry still produces one native link"), Volume->NativeLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Old Volume target A connection is removed after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetAQuery));
+    TestTrue(TEXT("New Volume target B connection is available after regeneration"), TestWorld.HasCompletePath(SourceQuery, TargetBQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationVolumeMultipleCrossingsTest,
+    "Omni.Navigation.Volume.MultipleCrossings",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationVolumeMultipleCrossingsTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniVolumeLinkDirection::BothWays,
+        4,
+        FVector(20.0f, 180.0f, 75.0f),
+        100.0f);
+    if (!TestNotNull(TEXT("Omni multi-crossing Volume"), Volume))
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Volume generates more than one native crossing"), Volume->NativeLinkCount > 1);
+    TestTrue(TEXT("Volume respects the configured four-link safety cap"), Volume->NativeLinkCount <= 4);
+    if (Volume->GeneratedLinks)
+    {
+        TestEqual(TEXT("Volume native-link status matches UNavLinkComponent output"), Volume->GeneratedLinks->Links.Num(), Volume->NativeLinkCount);
+    }
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Multi-crossing Volume provides Source to Target pathing"), TestWorld.HasCompletePath(OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Multi-crossing Volume provides Target to Source pathing"), TestWorld.HasCompletePath(OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationAgentsPointSelectedAgentOnlyTest,
+    "Omni.Navigation.Agents.Point.SelectedAgentOnly",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationAgentsPointSelectedAgentOnlyTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoAgentTwoIslandFixture())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Agent 0 baseline is disconnected"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Agent 1 baseline is disconnected"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+
+    const FNavAgentSelector Agent0Mask = TestWorld.GetAgentMask(0);
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniPointLinkDirection::BothWays,
+        &Agent0Mask);
+    if (!TestNotNull(TEXT("Agent-filtered Omni Point"), Point) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Selected agent 0 can traverse the Omni Point"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Selected agent 0 can traverse the Omni Point in reverse"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    TestFalse(TEXT("Unselected agent 1 cannot traverse the Omni Point"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Unselected agent 1 cannot traverse the Omni Point in reverse"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::RightQuery, OmniNavigationAutomation::LeftQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationAgentsSplineSelectedAgentOnlyTest,
+    "Omni.Navigation.Agents.Spline.SelectedAgentOnly",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationAgentsSplineSelectedAgentOnlyTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoAgentTwoIslandFixture())
+    {
+        return false;
+    }
+
+    const FNavAgentSelector Agent0Mask = TestWorld.GetAgentMask(0);
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniSplineLinkDirection::BothWays,
+        &Agent0Mask);
+    if (!TestNotNull(TEXT("Agent-filtered Omni Spline"), Spline) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestEqual(TEXT("Agent-filtered Spline generates one native link"), Spline->NativeLinkCount, 1);
+    TestTrue(TEXT("Selected agent 0 can traverse the Omni Spline"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Unselected agent 1 cannot traverse the Omni Spline"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationAgentsVolumeSelectedAgentOnlyTest,
+    "Omni.Navigation.Agents.Volume.SelectedAgentOnly",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationAgentsVolumeSelectedAgentOnlyTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoAgentTwoIslandFixture())
+    {
+        return false;
+    }
+
+    const FNavAgentSelector Agent0Mask = TestWorld.GetAgentMask(0);
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniVolumeLinkDirection::BothWays,
+        1,
+        FVector(20.0f, 20.0f, 75.0f),
+        200.0f,
+        &Agent0Mask);
+    if (!TestNotNull(TEXT("Agent-filtered Omni Volume"), Volume) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestEqual(TEXT("Agent-filtered Volume generates one native link"), Volume->NativeLinkCount, 1);
+    TestTrue(TEXT("Selected agent 0 can traverse the Omni Volume"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Unselected agent 1 cannot traverse the Omni Volume"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationAgentsPointMaskSwitchTest,
+    "Omni.Navigation.Agents.Point.MaskSwitch",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationAgentsPointMaskSwitchTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoAgentTwoIslandFixture())
+    {
+        return false;
+    }
+
+    const FNavAgentSelector Agent0Mask = TestWorld.GetAgentMask(0);
+    const FNavAgentSelector Agent1Mask = TestWorld.GetAgentMask(1);
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniPointLinkDirection::BothWays,
+        &Agent0Mask);
+    if (!TestNotNull(TEXT("Mask-switch Omni Point"), Point) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Agent 0 initially owns the Point connection"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestFalse(TEXT("Agent 1 initially does not own the Point connection"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+
+    Point->SupportedAgents = Agent1Mask;
+    Point->RegenerateLink();
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Agent 0 loses the Point connection after mask switch"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Agent 1 gains the Point connection after mask switch"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationAgentsPointAllAgentsTest,
+    "Omni.Navigation.Agents.Point.AllAgents",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationAgentsPointAllAgentsTest::RunTest(const FString& Parameters)
+{
+    OmniNavigationAutomation::FScopedNavigationWorld TestWorld(*this, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoAgentTwoIslandFixture())
+    {
+        return false;
+    }
+
+    const FNavAgentSelector AllAgentsMask = TestWorld.GetSupportedAgentsMask();
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        OmniNavigationAutomation::LeftLinkEndpoint,
+        OmniNavigationAutomation::RightLinkEndpoint,
+        EOmniPointLinkDirection::BothWays,
+        &AllAgentsMask);
+    if (!TestNotNull(TEXT("All-agents Omni Point"), Point) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Agent 0 can traverse an all-agents Point"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    TestTrue(TEXT("Agent 1 can traverse an all-agents Point"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
     return true;
 }
 
