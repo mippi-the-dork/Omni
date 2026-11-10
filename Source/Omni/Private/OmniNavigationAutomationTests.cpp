@@ -5,10 +5,12 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "ActorFactories/ActorFactory.h"
+#include "AIController.h"
 #include "AI/Navigation/NavigationTypes.h"
 #include "AI/NavigationSystemBase.h"
 #include "Builders/CubeBuilder.h"
 #include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -19,6 +21,8 @@
 #include "Engine/StaticMeshActor.h"
 #include "Engine/World.h"
 #include "Engine/WorldInitializationValues.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "Editor.h"
 #include "EditorWorldUtils.h"
 #include "HAL/PlatformProcess.h"
@@ -29,9 +33,12 @@
 #include "NavigationData.h"
 #include "NavigationPath.h"
 #include "Navigation/NavLinkProxy.h"
+#include "Navigation/PathFollowingComponent.h"
 #include "NavigationSystem.h"
 #include "NavAreas/NavArea_Default.h"
+#include "UObject/SoftObjectPtr.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UnrealType.h"
 
 namespace OmniNavigationAutomation
 {
@@ -57,6 +64,81 @@ namespace OmniNavigationAutomation
         Box.UpdateBounds();
     }
 
+    class FScopedDefaultCrowdManagerOverride
+    {
+    public:
+        explicit FScopedDefaultCrowdManagerOverride(FAutomationTestBase& InTest)
+            : Test(InTest)
+        {
+            NavigationSystemDefaults = GetMutableDefault<UNavigationSystemV1>();
+            if (!NavigationSystemDefaults)
+            {
+                Test.AddError(TEXT("Could not access UNavigationSystemV1 class defaults while disabling the Crowd Manager for the Omni navigation fixture."));
+                return;
+            }
+
+            CrowdManagerClassProperty = FindFProperty<FSoftClassProperty>(
+                UNavigationSystemV1::StaticClass(),
+                TEXT("CrowdManagerClass"));
+            if (!CrowdManagerClassProperty)
+            {
+                Test.AddError(TEXT("Could not resolve UNavigationSystemV1.CrowdManagerClass for the Omni navigation fixture."));
+                return;
+            }
+
+            OriginalCrowdManagerClass = CrowdManagerClassProperty->GetPropertyValue_InContainer(NavigationSystemDefaults);
+
+            // These synthetic worlds exercise Recast pathfinding and Omni native-link
+            // registration only. They never use Detour crowd following. UE 5.8.3 can
+            // ask UCrowdManager to find a replacement RecastNavMesh while Navigation
+            // is unregistering NavData during world teardown, which produces a false
+            // warning after an otherwise valid test. Disable the class on the CDO
+            // before this isolated Navigation System instance is created, then restore
+            // it after the synthetic world has been destroyed. No config is saved.
+            CrowdManagerClassProperty->SetPropertyValue_InContainer(
+                NavigationSystemDefaults,
+                FSoftObjectPtr());
+            bOverrideInstalled = true;
+
+            const FSoftObjectPtr& AppliedValue = CrowdManagerClassProperty->GetPropertyValue_InContainer(NavigationSystemDefaults);
+            bApplied = AppliedValue.ToSoftObjectPath().IsNull();
+            if (!bApplied)
+            {
+                Test.AddError(TEXT("Could not temporarily disable UNavigationSystemV1.CrowdManagerClass for the Omni navigation fixture."));
+            }
+        }
+
+        ~FScopedDefaultCrowdManagerOverride()
+        {
+            Restore();
+        }
+
+        bool WasApplied() const
+        {
+            return bApplied;
+        }
+
+        void Restore()
+        {
+            if (bOverrideInstalled && NavigationSystemDefaults && CrowdManagerClassProperty)
+            {
+                CrowdManagerClassProperty->SetPropertyValue_InContainer(
+                    NavigationSystemDefaults,
+                    OriginalCrowdManagerClass);
+                bOverrideInstalled = false;
+                bApplied = false;
+            }
+        }
+
+    private:
+        FAutomationTestBase& Test;
+        UNavigationSystemV1* NavigationSystemDefaults = nullptr;
+        FSoftClassProperty* CrowdManagerClassProperty = nullptr;
+        FSoftObjectPtr OriginalCrowdManagerClass;
+        bool bOverrideInstalled = false;
+        bool bApplied = false;
+    };
+
     class FScopedDefaultSupportedAgentsOverride
     {
     public:
@@ -75,7 +157,29 @@ namespace OmniNavigationAutomation
                 return;
             }
 
-            OriginalAgents = NavigationSystemDefaults->GetSupportedAgents();
+            FArrayProperty* SupportedAgentsProperty = FindFProperty<FArrayProperty>(
+                UNavigationSystemV1::StaticClass(),
+                TEXT("SupportedAgents"));
+            FStructProperty* SupportedAgentStructProperty = SupportedAgentsProperty
+                ? CastField<FStructProperty>(SupportedAgentsProperty->Inner)
+                : nullptr;
+
+            if (!SupportedAgentsProperty
+                || !SupportedAgentStructProperty
+                || SupportedAgentStructProperty->Struct != FNavDataConfig::StaticStruct())
+            {
+                Test.AddError(TEXT("Could not resolve UNavigationSystemV1.SupportedAgents as TArray<FNavDataConfig> for the multi-agent Omni fixture."));
+                return;
+            }
+
+            MutableAgents = SupportedAgentsProperty->ContainerPtrToValuePtr<TArray<FNavDataConfig>>(NavigationSystemDefaults);
+            if (!MutableAgents)
+            {
+                Test.AddError(TEXT("Could not access the UNavigationSystemV1 class-default SupportedAgents storage."));
+                return;
+            }
+
+            OriginalAgents = *MutableAgents;
 
             FNavDataConfig AgentA = UNavigationSystemV1::GetDefaultSupportedAgent();
             AgentA.Name = TEXT("OmniAgentA");
@@ -88,22 +192,31 @@ namespace OmniNavigationAutomation
             AgentB.AgentRadius = 20.0f;
             AgentB.AgentHeight = 120.0f;
 
-            TArray<FNavDataConfig> TestAgents;
+            TestAgents.Reset(2);
             TestAgents.Add(AgentA);
             TestAgents.Add(AgentB);
 
-            // Supported Agents are project-level UNavigationSystemV1 config.
-            // Override the class defaults before the synthetic world's Navigation
-            // System instance is created so the instance inherits the two-agent
-            // configuration through Unreal's normal construction/DoInitialSetup path.
-            // Do not SaveConfig(); this is an in-memory automation-only override.
-            NavigationSystemDefaults->OverrideSupportedAgents(TestAgents);
-            bApplied = NavigationSystemDefaults->GetSupportedAgents().Num() == 2;
+            // OverrideSupportedAgents() does not replace the project-level list.
+            // It reloads SupportedAgents from the class default object and only
+            // builds a mask by matching NewSupportedAgents against entries that
+            // already exist there. For a project configured with one agent, it
+            // therefore cannot manufacture a second synthetic agent.
+            //
+            // The SupportedAgents property itself is a reflected config array on
+            // UNavigationSystemV1. Temporarily replace that class-default storage
+            // directly before the synthetic Navigation System instance is created.
+            // No config file is written and Modify()/SaveConfig() are never called.
+            *MutableAgents = TestAgents;
+            bOverrideInstalled = true;
+            bApplied = MutableAgents->Num() == 2
+                && (*MutableAgents)[0].Name == AgentA.Name
+                && (*MutableAgents)[1].Name == AgentB.Name;
+
             if (!bApplied)
             {
                 Test.AddError(FString::Printf(
-                    TEXT("Multi-agent Omni fixture could not install two agents on UNavigationSystemV1 class defaults; found %d."),
-                    NavigationSystemDefaults->GetSupportedAgents().Num()));
+                    TEXT("Multi-agent Omni fixture could not install two agents on the reflected UNavigationSystemV1 class-default SupportedAgents property; found %d."),
+                    MutableAgents->Num()));
             }
         }
 
@@ -119,9 +232,10 @@ namespace OmniNavigationAutomation
 
         void Restore()
         {
-            if (bApplied && NavigationSystemDefaults)
+            if (bOverrideInstalled && MutableAgents)
             {
-                NavigationSystemDefaults->OverrideSupportedAgents(OriginalAgents);
+                *MutableAgents = OriginalAgents;
+                bOverrideInstalled = false;
                 bApplied = false;
             }
         }
@@ -129,8 +243,18 @@ namespace OmniNavigationAutomation
     private:
         FAutomationTestBase& Test;
         UNavigationSystemV1* NavigationSystemDefaults = nullptr;
+        TArray<FNavDataConfig>* MutableAgents = nullptr;
         TArray<FNavDataConfig> OriginalAgents;
+        TArray<FNavDataConfig> TestAgents;
+        bool bOverrideInstalled = false;
         bool bApplied = false;
+    };
+
+    struct FCharacterMoveToHarness
+    {
+        ACharacter* Character = nullptr;
+        AAIController* Controller = nullptr;
+        UPathFollowingComponent* PathFollowing = nullptr;
     };
 
     class FScopedNavigationWorld
@@ -162,8 +286,14 @@ namespace OmniNavigationAutomation
                 return;
             }
 
-            FScopedDefaultSupportedAgentsOverride DefaultAgentsOverride(Test, bConfigureTwoAgents);
-            if (bConfigureTwoAgents && !DefaultAgentsOverride.WasApplied())
+            CrowdManagerOverride = MakeUnique<FScopedDefaultCrowdManagerOverride>(Test);
+            if (!CrowdManagerOverride || !CrowdManagerOverride->WasApplied())
+            {
+                return;
+            }
+
+            DefaultAgentsOverride = MakeUnique<FScopedDefaultSupportedAgentsOverride>(Test, bConfigureTwoAgents);
+            if (bConfigureTwoAgents && (!DefaultAgentsOverride || !DefaultAgentsOverride->WasApplied()))
             {
                 return;
             }
@@ -229,12 +359,6 @@ namespace OmniNavigationAutomation
 
             if (bConfigureTwoAgents)
             {
-                // The per-world instance has now inherited the temporary class-default
-                // configuration through Unreal's normal initialization path. Restore the
-                // project defaults immediately so this synthetic fixture cannot leak its
-                // two-agent setup into later editor work or automation tests.
-                DefaultAgentsOverride.Restore();
-
                 if (NavigationSystem->GetSupportedAgents().Num() != 2)
                 {
                     Test.AddError(FString::Printf(
@@ -248,7 +372,21 @@ namespace OmniNavigationAutomation
                 TwoAgentMask.Set(0);
                 TwoAgentMask.Set(1);
                 TwoAgentMask.MarkInitialized();
+                // Keep the temporary CDO agent list alive for the lifetime of this
+                // synthetic world. SetSupportedAgentsMask() and other public filter
+                // paths call ApplySupportedAgentsFilter(), which repopulates the
+                // instance from the class default object. Restoring the CDO earlier
+                // would collapse this world back to the project's single configured
+                // agent on the next filter application.
                 NavigationSystem->SetSupportedAgentsMask(TwoAgentMask);
+
+                if (NavigationSystem->GetSupportedAgents().Num() != 2
+                    || !NavigationSystem->GetSupportedAgentsMask().Contains(0)
+                    || !NavigationSystem->GetSupportedAgentsMask().Contains(1))
+                {
+                    Test.AddError(TEXT("Multi-agent Omni fixture lost its two-agent configuration while applying the world Supported Agents mask."));
+                    return;
+                }
             }
 
             if (NavigationSystem->GetSupportedAgents().IsEmpty())
@@ -281,6 +419,8 @@ namespace OmniNavigationAutomation
             CubeMesh = nullptr;
             World = nullptr;
             EditorWorldScope.Reset();
+            DefaultAgentsOverride.Reset();
+            CrowdManagerOverride.Reset();
         }
 
         bool IsReady() const
@@ -594,6 +734,23 @@ namespace OmniNavigationAutomation
                 NavigationSystem->ProcessPendingOctreeUpdates();
             }
 
+            // OnNavigationBoundsUpdated() queues PendingNavBoundsUpdates; it does
+            // not move those bounds into RegisteredNavBounds immediately. UE does
+            // that in UNavigationSystemV1::Tick(). Recast generator initialization
+            // asks GetNavigationBoundsForNavData() for RegisteredNavBounds, so the
+            // old fixture could construct its first dtNavMesh before the bounds had
+            // been committed and log "Failed to create navmesh of size 0". Perform
+            // one Navigation tick while the initial AsyncLoadLock is still held.
+            // This commits bounds and lets UE create any missing NavData from known
+            // bounds, but cannot begin generation yet. Subsequent BuildNavigation()
+            // calls do not repeat this lifecycle-only tick.
+            if (!bInitialNavigationLifecycleTicked)
+            {
+                World->Tick(LEVELTICK_All, TestTickSeconds);
+                NavigationSystem->ProcessPendingOctreeUpdates();
+                bInitialNavigationLifecycleTicked = true;
+            }
+
             // UE 5.8 can hold navigation generation behind AsyncLoadLock until the
             // normal map-loading lifecycle reports that initial async loading is done.
             // This transient editor world has no corresponding map-load completion
@@ -753,6 +910,163 @@ namespace OmniNavigationAutomation
             }
 
             return true;
+        }
+
+        bool SpawnCharacterMoveToHarness(const FVector& NavStart, FCharacterMoveToHarness& OutHarness)
+        {
+            OutHarness = FCharacterMoveToHarness();
+
+            if (!IsReady())
+            {
+                return false;
+            }
+
+            const FNavDataConfig& AgentConfig = NavigationSystem->GetDefaultSupportedAgentConfig();
+            const float AgentRadius = FMath::Max(AgentConfig.AgentRadius, 10.0f);
+            const float AgentHeight = FMath::Max(AgentConfig.AgentHeight, AgentRadius * 2.0f);
+            const float CapsuleHalfHeight = FMath::Max(AgentHeight * 0.5f, AgentRadius);
+
+            FActorSpawnParameters PawnSpawnParameters;
+            PawnSpawnParameters.ObjectFlags |= RF_Transient;
+            PawnSpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+            ACharacter* Character = World->SpawnActor<ACharacter>(
+                ACharacter::StaticClass(),
+                FVector(NavStart.X, NavStart.Y, NavStart.Z + CapsuleHalfHeight),
+                FRotator::ZeroRotator,
+                PawnSpawnParameters);
+            if (!Character)
+            {
+                Test.AddError(TEXT("Failed to spawn the Omni navigation Character movement fixture."));
+                return false;
+            }
+
+            UCapsuleComponent* Capsule = Character->GetCapsuleComponent();
+            UCharacterMovementComponent* Movement = Character->GetCharacterMovement();
+            if (!Capsule || !Movement)
+            {
+                Test.AddError(TEXT("Omni movement fixture Character is missing its capsule or Character Movement component."));
+                return false;
+            }
+
+            Capsule->SetCapsuleSize(AgentRadius, CapsuleHalfHeight, true);
+            Character->SetActorLocation(
+                FVector(NavStart.X, NavStart.Y, NavStart.Z + CapsuleHalfHeight),
+                false,
+                nullptr,
+                ETeleportType::TeleportPhysics);
+
+            // Keep pathfinding on the same ground-nav agent that built this Recast
+            // fixture, while using Flying only as the physical execution mode. The
+            // disconnected islands deliberately require an off-mesh link; Flying
+            // lets a stock Character Movement component physically traverse that
+            // segment without introducing a custom movement shim or Jump behavior.
+            Movement->NavAgentProps = static_cast<const FNavAgentProperties&>(AgentConfig);
+            Movement->GravityScale = 0.0f;
+            Movement->MaxFlySpeed = 600.0f;
+            Movement->BrakingDecelerationFlying = 2048.0f;
+            Movement->SetMovementMode(MOVE_Flying);
+            Movement->StopMovementImmediately();
+            Movement->SetComponentTickEnabled(true);
+            Character->SetActorTickEnabled(true);
+
+            FActorSpawnParameters ControllerSpawnParameters;
+            ControllerSpawnParameters.ObjectFlags |= RF_Transient;
+            AAIController* Controller = World->SpawnActor<AAIController>(
+                AAIController::StaticClass(),
+                FVector::ZeroVector,
+                FRotator::ZeroRotator,
+                ControllerSpawnParameters);
+            if (!Controller)
+            {
+                Test.AddError(TEXT("Failed to spawn the Omni navigation AIController movement fixture."));
+                return false;
+            }
+
+            Controller->SetActorTickEnabled(true);
+            Controller->Possess(Character);
+            if (Controller->GetPawn() != Character || Character->GetController() != Controller)
+            {
+                Test.AddError(TEXT("Omni movement fixture AIController did not possess the Character."));
+                return false;
+            }
+
+            UPathFollowingComponent* PathFollowing = Controller->GetPathFollowingComponent();
+            if (!PathFollowing)
+            {
+                Test.AddError(TEXT("Omni movement fixture AIController has no PathFollowingComponent."));
+                return false;
+            }
+
+            PathFollowing->SetBlockDetectionState(false);
+            PathFollowing->SetComponentTickEnabled(true);
+            if (!PathFollowing->IsPathFollowingAllowed())
+            {
+                Test.AddError(TEXT("Omni movement fixture PathFollowingComponent does not allow path following for the possessed Character."));
+                return false;
+            }
+
+            OutHarness.Character = Character;
+            OutHarness.Controller = Controller;
+            OutHarness.PathFollowing = PathFollowing;
+            return true;
+        }
+
+        EPathFollowingRequestResult::Type RequestCharacterMoveTo(
+            const FCharacterMoveToHarness& Harness,
+            const FVector& Goal) const
+        {
+            if (!Harness.Controller)
+            {
+                return EPathFollowingRequestResult::Failed;
+            }
+
+            return Harness.Controller->MoveToLocation(
+                Goal,
+                40.0f,
+                false,
+                true,
+                true,
+                true,
+                nullptr,
+                false);
+        }
+
+        bool WaitForCharacterMoveToCompletion(
+            const FCharacterMoveToHarness& Harness,
+            bool& bOutReachedGoal,
+            bool& bOutObservedNavigationLinkSegment,
+            double TimeoutSeconds = 5.0)
+        {
+            bOutReachedGoal = false;
+            bOutObservedNavigationLinkSegment = false;
+
+            if (!World || !NavigationSystem || !Harness.Character || !Harness.PathFollowing)
+            {
+                return false;
+            }
+
+            const int32 MaxTicks = FMath::Max(
+                1,
+                static_cast<int32>(TimeoutSeconds / static_cast<double>(TestTickSeconds)) + 1);
+
+            for (int32 TickIndex = 0; TickIndex < MaxTicks; ++TickIndex)
+            {
+                bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+
+                World->Tick(LEVELTICK_All, TestTickSeconds);
+                NavigationSystem->ProcessPendingOctreeUpdates();
+
+                bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+
+                if (Harness.PathFollowing->GetStatus() == EPathFollowingStatus::Idle)
+                {
+                    bOutReachedGoal = Harness.PathFollowing->DidMoveReachGoal();
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         bool HasCompletePath(const FVector& Start, const FVector& End) const
@@ -955,6 +1269,8 @@ namespace OmniNavigationAutomation
         }
 
         FAutomationTestBase& Test;
+        TUniquePtr<FScopedDefaultCrowdManagerOverride> CrowdManagerOverride;
+        TUniquePtr<FScopedDefaultSupportedAgentsOverride> DefaultAgentsOverride;
         TUniquePtr<FScopedEditorWorld> EditorWorldScope;
         UWorld* World = nullptr;
         UNavigationSystemV1* NavigationSystem = nullptr;
@@ -963,6 +1279,7 @@ namespace OmniNavigationAutomation
         UStaticMesh* CubeMesh = nullptr;
         FNavAgentSelector SupportedAgentsMask;
         bool bNavigationActorsInitialized = false;
+        bool bInitialNavigationLifecycleTicked = false;
         bool bConfigureTwoAgents = false;
     };
 
@@ -1893,6 +2210,223 @@ bool FOmniNavigationAgentsPointAllAgentsTest::RunTest(const FString& Parameters)
 
     TestTrue(TEXT("Agent 0 can traverse an all-agents Point"), TestWorld.HasCompletePathForAgent(0, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
     TestTrue(TEXT("Agent 1 can traverse an all-agents Point"), TestWorld.HasCompletePathForAgent(1, OmniNavigationAutomation::LeftQuery, OmniNavigationAutomation::RightQuery));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationMoveToBaselineDisconnectedTest,
+    "Omni.Navigation.MoveTo.BaselineDisconnected",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationMoveToBaselineDisconnectedTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("AI MoveTo rejects the disconnected two-island baseline when partial paths are disallowed"),
+        RequestResult == EPathFollowingRequestResult::Failed);
+    TestTrue(TEXT("Rejected baseline MoveTo leaves PathFollowing idle"),
+        Harness.PathFollowing && Harness.PathFollowing->GetStatus() == EPathFollowingStatus::Idle);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationMoveToPointNativeMovementTest,
+    "Omni.Navigation.MoveTo.Point.NativeMovement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationMoveToPointNativeMovementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(LeftLinkEndpoint, RightLinkEndpoint, EOmniPointLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Point"), Point) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Point AI MoveTo starts through the Omni-generated native link"),
+        RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    const FNavPathSharedPtr Path = Harness.PathFollowing ? Harness.PathFollowing->GetPath() : FNavPathSharedPtr();
+    TestTrue(TEXT("Point AI MoveTo owns a complete native navigation path"),
+        Path.IsValid() && !Path->IsPartial());
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment);
+
+    TestTrue(TEXT("Point AI MoveTo completes within the movement fixture timeout"), bCompleted);
+    TestTrue(TEXT("Point AI MoveTo reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Point PathFollowing enters a native navigation-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Point movement finishes on the target island"),
+        Harness.Character && Harness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationMoveToSplineNativeMovementTest,
+    "Omni.Navigation.MoveTo.Spline.NativeMovement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationMoveToSplineNativeMovementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(LeftLinkEndpoint, RightLinkEndpoint, EOmniSplineLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Spline"), Spline) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Spline AI MoveTo starts through the Omni-generated native link"),
+        RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment);
+
+    TestTrue(TEXT("Spline AI MoveTo completes within the movement fixture timeout"), bCompleted);
+    TestTrue(TEXT("Spline AI MoveTo reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Spline PathFollowing enters a native navigation-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Spline movement finishes on the target island"),
+        Harness.Character && Harness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationMoveToVolumeNativeMovementTest,
+    "Omni.Navigation.MoveTo.Volume.NativeMovement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationMoveToVolumeNativeMovementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(LeftLinkEndpoint, RightLinkEndpoint, EOmniVolumeLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Volume"), Volume) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Volume AI MoveTo starts through the Omni-generated native link"),
+        RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment);
+
+    TestTrue(TEXT("Volume AI MoveTo completes within the movement fixture timeout"), bCompleted);
+    TestTrue(TEXT("Volume AI MoveTo reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Volume PathFollowing enters a native navigation-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Volume movement finishes on the target island"),
+        Harness.Character && Harness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationMoveToPointDisableRemovesPathTest,
+    "Omni.Navigation.MoveTo.Point.DisableRemovesMoveTo",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationMoveToPointDisableRemovesPathTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(LeftLinkEndpoint, RightLinkEndpoint, EOmniPointLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Point"), Point) || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Enabled Point provides the complete path required by AI MoveTo"),
+        TestWorld.HasCompletePath(LeftQuery, RightQuery));
+
+    Point->bEnabled = false;
+    Point->RegenerateLink();
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    TestFalse(TEXT("Disabled Point removes the complete native path"),
+        TestWorld.HasCompletePath(LeftQuery, RightQuery));
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("AI MoveTo is rejected after the Omni Point is disabled"),
+        RequestResult == EPathFollowingRequestResult::Failed);
     return true;
 }
 
