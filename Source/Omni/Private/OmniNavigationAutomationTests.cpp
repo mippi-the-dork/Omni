@@ -961,11 +961,16 @@ namespace OmniNavigationAutomation
             // disconnected islands deliberately require an off-mesh link; Flying
             // lets a stock Character Movement component physically traverse that
             // segment without introducing a custom movement shim or Jump behavior.
+            // Synthetic editor worlds do not guarantee that Character Movement has
+            // completed the same UpdatedComponent binding that a normal gameplay
+            // world performs during component initialization. Make the stock CMC
+            // ownership explicit before asking PathFollowing to consume it.
+            Movement->SetUpdatedComponent(Capsule);
+            Movement->Activate(true);
             Movement->NavAgentProps = static_cast<const FNavAgentProperties&>(AgentConfig);
             Movement->GravityScale = 0.0f;
             Movement->MaxFlySpeed = 600.0f;
             Movement->BrakingDecelerationFlying = 2048.0f;
-            Movement->SetMovementMode(MOVE_Flying);
             Movement->StopMovementImmediately();
             Movement->SetComponentTickEnabled(true);
             Character->SetActorTickEnabled(true);
@@ -991,6 +996,31 @@ namespace OmniNavigationAutomation
                 return false;
             }
 
+            // Possession restarts ACharacter and can restore its default movement
+            // mode. Reassert the fixture's physical execution mode only after
+            // possession, and refresh the CMC binding/agent state that PathFollowing
+            // will query. Pathfinding still uses the fixture's ground Recast agent;
+            // Flying is only the physical movement mode across the synthetic gap.
+            Movement->SetUpdatedComponent(Capsule);
+            Movement->Activate(true);
+            Movement->NavAgentProps = static_cast<const FNavAgentProperties&>(AgentConfig);
+            Movement->ResetMoveState();
+            Movement->SetMovementMode(MOVE_Flying);
+            Movement->StopMovementImmediately();
+            Movement->SetComponentTickEnabled(true);
+
+            if (Movement->UpdatedComponent != Capsule || !Movement->HasValidData())
+            {
+                Test.AddError(FString::Printf(
+                    TEXT("Omni movement fixture Character Movement is not valid after possession. UpdatedComponent=%s Capsule=%s Registered=%d Active=%d MovementMode=%d."),
+                    *GetNameSafe(Movement->UpdatedComponent),
+                    *GetNameSafe(Capsule),
+                    Movement->IsRegistered() ? 1 : 0,
+                    Movement->IsActive() ? 1 : 0,
+                    static_cast<int32>(Movement->MovementMode)));
+                return false;
+            }
+
             UPathFollowingComponent* PathFollowing = Controller->GetPathFollowingComponent();
             if (!PathFollowing)
             {
@@ -1002,7 +1032,14 @@ namespace OmniNavigationAutomation
             PathFollowing->SetComponentTickEnabled(true);
             if (!PathFollowing->IsPathFollowingAllowed())
             {
-                Test.AddError(TEXT("Omni movement fixture PathFollowingComponent does not allow path following for the possessed Character."));
+                Test.AddError(FString::Printf(
+                    TEXT("Omni movement fixture PathFollowingComponent does not allow path following. CMCValid=%d UpdatedComponent=%s Registered=%d Active=%d MovementMode=%d RootSimulatingPhysics=%d."),
+                    Movement->HasValidData() ? 1 : 0,
+                    *GetNameSafe(Movement->UpdatedComponent),
+                    Movement->IsRegistered() ? 1 : 0,
+                    Movement->IsActive() ? 1 : 0,
+                    static_cast<int32>(Movement->MovementMode),
+                    Character->GetRootComponent() && Character->GetRootComponent()->IsSimulatingPhysics() ? 1 : 0));
                 return false;
             }
 
