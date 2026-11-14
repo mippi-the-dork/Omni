@@ -255,6 +255,7 @@ namespace OmniNavigationAutomation
         ACharacter* Character = nullptr;
         AAIController* Controller = nullptr;
         UPathFollowingComponent* PathFollowing = nullptr;
+        UCharacterMovementComponent* Movement = nullptr;
     };
 
     class FScopedNavigationWorld
@@ -1046,6 +1047,7 @@ namespace OmniNavigationAutomation
             OutHarness.Character = Character;
             OutHarness.Controller = Controller;
             OutHarness.PathFollowing = PathFollowing;
+            OutHarness.Movement = Movement;
             return true;
         }
 
@@ -1078,11 +1080,16 @@ namespace OmniNavigationAutomation
             bOutReachedGoal = false;
             bOutObservedNavigationLinkSegment = false;
 
-            if (!World || !NavigationSystem || !Harness.Character || !Harness.PathFollowing)
+            if (!World
+                || !NavigationSystem
+                || !Harness.Character
+                || !Harness.PathFollowing
+                || !Harness.Movement)
             {
                 return false;
             }
 
+            const FVector StartLocation = Harness.Character->GetActorLocation();
             const int32 MaxTicks = FMath::Max(
                 1,
                 static_cast<int32>(TimeoutSeconds / static_cast<double>(TestTickSeconds)) + 1);
@@ -1091,8 +1098,33 @@ namespace OmniNavigationAutomation
             {
                 bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
 
-                World->Tick(LEVELTICK_All, TestTickSeconds);
+                // FScopedEditorWorld is intentionally used by the native-navigation
+                // fixture because it gives us deterministic transient Recast setup
+                // without PIE/GameMode state. Its world tick is reliable for
+                // Navigation System work, but it is not a gameplay lifecycle and
+                // therefore should not be treated as proof that normal actor/component
+                // scheduler state exists.
+                //
+                // Advance world/navigation time without actor ticks, then execute the
+                // two stock runtime components that own an AI MoveTo in the same order
+                // Unreal uses during gameplay: PathFollowing produces the movement
+                // request, CharacterMovement consumes it. This keeps the test on the
+                // real AAIController/UPathFollowingComponent/UCharacterMovementComponent
+                // code paths while making the synthetic editor-world harness deterministic.
+                World->Tick(LEVELTICK_TimeOnly, TestTickSeconds);
                 NavigationSystem->ProcessPendingOctreeUpdates();
+
+                Harness.PathFollowing->TickComponent(
+                    TestTickSeconds,
+                    LEVELTICK_All,
+                    &Harness.PathFollowing->PrimaryComponentTick);
+
+                bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+
+                Harness.Movement->TickComponent(
+                    TestTickSeconds,
+                    LEVELTICK_All,
+                    &Harness.Movement->PrimaryComponentTick);
 
                 bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
 
@@ -1103,6 +1135,18 @@ namespace OmniNavigationAutomation
                 }
             }
 
+            Test.AddError(FString::Printf(
+                TEXT("Omni AI MoveTo timed out after %.2f synthetic seconds. Start=%s Final=%s Status=%d ReachedGoal=%d ObservedNavLink=%d Velocity=%s MovementMode=%d PathFollowingTickRegistered=%d MovementTickRegistered=%d."),
+                TimeoutSeconds,
+                *StartLocation.ToCompactString(),
+                *Harness.Character->GetActorLocation().ToCompactString(),
+                static_cast<int32>(Harness.PathFollowing->GetStatus()),
+                Harness.PathFollowing->DidMoveReachGoal() ? 1 : 0,
+                bOutObservedNavigationLinkSegment ? 1 : 0,
+                *Harness.Movement->Velocity.ToCompactString(),
+                static_cast<int32>(Harness.Movement->MovementMode),
+                Harness.PathFollowing->PrimaryComponentTick.IsTickFunctionRegistered() ? 1 : 0,
+                Harness.Movement->PrimaryComponentTick.IsTickFunctionRegistered() ? 1 : 0));
             return false;
         }
 
