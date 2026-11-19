@@ -30,6 +30,17 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
     FOmniCustomTraversalRequest, Request,
     EOmniCustomTraversalFinishReason, Reason);
 
+/** Native C++ request event. Mirrors OnTraversalRequestedDetailed without requiring a UFUNCTION receiver. */
+DECLARE_MULTICAST_DELEGATE_OneParam(
+    FOnOmniCustomTraversalRequestedNative,
+    const FOmniCustomTraversalRequest&);
+
+/** Native C++ finish event. Mirrors OnTraversalFinished without requiring a UFUNCTION receiver. */
+DECLARE_MULTICAST_DELEGATE_TwoParams(
+    FOnOmniCustomTraversalFinishedNative,
+    const FOmniCustomTraversalRequest&,
+    EOmniCustomTraversalFinishReason);
+
 /**
  * Runtime helper for designer-defined Omni traversal.
  *
@@ -61,6 +72,12 @@ public:
     /** Reports completion, timeout, cancellation, or the no-listener safety release. */
     UPROPERTY(BlueprintAssignable, Category="Omni|Custom Traversal")
     FOnOmniCustomTraversalFinished OnTraversalFinished;
+
+    /** Native C++ equivalent of OnTraversalRequestedDetailed. Native listeners count as valid project traversal handlers. */
+    FOnOmniCustomTraversalRequestedNative OnTraversalRequestedNative;
+
+    /** Native C++ equivalent of OnTraversalFinished. */
+    FOnOmniCustomTraversalFinishedNative OnTraversalFinishedNative;
 
     /** Resume normal path following for one active Custom traversal request. */
     UFUNCTION(BlueprintCallable, Category="Omni|Custom Traversal", meta=(DisplayName="Complete Custom Traversal"))

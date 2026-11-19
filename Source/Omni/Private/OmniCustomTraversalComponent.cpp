@@ -273,10 +273,12 @@ void UOmniCustomTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponen
 
     SetComponentTickEnabled(true);
 
-    // Copy before broadcasting. A Blueprint listener is allowed to complete the request
+    // Copy before broadcasting. Blueprint or native C++ listeners may complete the request
     // synchronously, which can remove the active array entry while delegates are executing.
     const FOmniCustomTraversalRequest RequestCopy = Traversal.Request;
-    const bool bHasRequestListener = OnTraversalRequestedDetailed.IsBound() || OnTraversalRequested.IsBound();
+    const bool bHasRequestListener = OnTraversalRequestedDetailed.IsBound()
+        || OnTraversalRequested.IsBound()
+        || OnTraversalRequestedNative.IsBound();
     if (OnTraversalRequestedDetailed.IsBound())
     {
         OnTraversalRequestedDetailed.Broadcast(RequestCopy);
@@ -289,6 +291,11 @@ void UOmniCustomTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponen
             Pawn,
             RequestCopy.Start,
             RequestCopy.Destination);
+    }
+
+    if (OnTraversalRequestedNative.IsBound())
+    {
+        OnTraversalRequestedNative.Broadcast(RequestCopy);
     }
 
     if (!bHasRequestListener)
@@ -421,6 +428,11 @@ void UOmniCustomTraversalComponent::FinishTraversalAtIndex(int32 Index, EOmniCus
     if (OnTraversalFinished.IsBound())
     {
         OnTraversalFinished.Broadcast(Traversal.Request, Reason);
+    }
+
+    if (OnTraversalFinishedNative.IsBound())
+    {
+        OnTraversalFinishedNative.Broadcast(Traversal.Request, Reason);
     }
 
     if (ActiveTraversals.IsEmpty())

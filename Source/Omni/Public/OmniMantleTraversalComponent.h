@@ -42,6 +42,7 @@ public:
     void ClearLinks();
 
     int32 GetGeneratedLinkCount() const { return MantleLinks.Num(); }
+    int32 GetActiveTraversalCount() const { return ActiveTraversals.Num(); }
 
 private:
     struct FActiveMantleTraversal

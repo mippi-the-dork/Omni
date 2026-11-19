@@ -31,7 +31,8 @@ public class Omni : ModuleRules
                     "UnrealEd",
                     "ToolMenus",
                     "Slate",
-                    "SlateCore"
+                    "SlateCore",
+                    "GameplayTasks"
                 }
             );
         }

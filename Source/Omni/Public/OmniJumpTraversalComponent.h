@@ -43,6 +43,7 @@ public:
     void ClearLinks();
 
     int32 GetGeneratedLinkCount() const { return JumpLinks.Num(); }
+    int32 GetActiveTraversalCount() const { return ActiveTraversals.Num(); }
 
 private:
     struct FActiveJumpTraversal
@@ -52,10 +53,12 @@ private:
         TWeakObjectPtr<UNavLinkCustomComponent> Link;
         FVector Destination = FVector::ZeroVector;
         float ElapsedTime = 0.0f;
+        uint8 PreviousMovementMode = 0;
+        uint8 PreviousCustomMovementMode = 0;
     };
 
     void HandleMoveReachedLink(UNavLinkCustomComponent* LinkComp, UObject* PathCompObject, const FVector& DestinationPoint);
-    void FinishTraversalAtIndex(int32 Index);
+    void FinishTraversalAtIndex(int32 Index, bool bRestorePreJumpMovement = false);
     void FinishTraversalsForLink(UNavLinkCustomComponent* LinkComp);
     FVector CalculateLaunchVelocity(const ACharacter& Character, const FVector& DestinationPoint) const;
     bool IsConfigurationEquivalent(const TArray<FOmniJumpLinkSpec>& LinkSpecs, const FNavAgentSelector& SupportedAgents, TSubclassOf<UNavAreaBase> AreaClass, float InJumpApexHeight, float InLandingTolerance, float InTraversalTimeout) const;

@@ -1,12 +1,14 @@
+**Current development build: 0.73.0** - Adds native Behavior Tree Move To integration coverage and observed-blackboard repath ownership tests.
+
 # Omni
 
 Omni is an Unreal Engine navigation authoring plugin for creating enhanced point links and broad traversal coverage without manually placing large numbers of individual NavLinkProxy actors.
 
 ## Current development version
 
-**Omni 0.69.4** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
+**Omni 0.73.0** targets **Unreal Engine 5.8.0 - 5.8.3**, Windows 64-bit.
 
-0.69.4 cleans up the synthetic native-navigation fixture after the Point, Spline, Volume, and Supported Agents live-Recast gates all reached green. The fixture now performs one Navigation System tick while the initial `AsyncLoadLock` is still held so queued `NavMeshBoundsVolume` updates are committed before Recast generator construction. This prevents the first-build `ConstructTiledNavMesh: Failed to create navmesh of size 0` warning without suppressing it. The fixture also temporarily clears the reflected `UNavigationSystemV1.CrowdManagerClass` class-default property for the lifetime of each synthetic world because these pathfinding tests do not exercise Detour crowd following; the original value is restored only after the transient world is destroyed and is never saved to config. No production Omni navigation or traversal behavior changes in 0.69.4.
+The full 0.72.2 traversal ownership matrix is user-verified green: Point Jump, Point Mantle, Spline Jump, Spline Mantle, Volume Custom no-listener, bound Custom completion, Jump replacement, Mantle replacement, Custom late-completion replacement, and explicit Custom abort/recovery. 0.73.0 adds the next integration layer using a real transient `UBehaviorTree`, `UBlackboardData`, and stock `UBTTask_MoveTo`. Native Point movement and Spline Mantle are exercised through Behavior Tree Move To, while a Jump test retargets an observed vector blackboard key during active custom-link ownership to verify Unreal's Behavior Tree repath path cannot leave stale Omni traversal or ballistic state behind.
 
 This development build keeps the generated-link registration fix while removing its dependency on Unreal's editor-only `bRegisteredForNavigation` implementation state. Point, Spline, Volume, and the internal native-link test actor now refresh generated native links through the public `ReregisterComponent()` lifecycle after link mutations, so empty-to-valid, valid-to-valid, and valid-to-empty transitions rebuild navigation state in both editor and packaged Win64 targets. Point and Spline are now validated against live Recast pathfinding, and 0.68.0 extends that same behavioral contract to Volume.
 
@@ -18,7 +20,7 @@ This development build includes the native Navigation System automation gate int
 
 This development build continues post-migration native-navigation integration hardening with **path-following interruption ownership checks**. Jump, Mantle, and Custom traversal now verify that Unreal's `UPathFollowingComponent` still reports their exact generated `UNavLinkCustomComponent` as the current custom link. If AI MoveTo, Behavior Tree Move To, repathing, or another move request aborts/replaces the traversal while the objects remain alive, Omni cancels the stale traversal immediately instead of waiting for timeout.
 
-Traversal cleanup now calls `FinishUsingCustomLink()` only while that traversal still owns Unreal's current custom link, so stale Jump/Mantle/Custom cleanup cannot accidentally advance a newer move. Custom `CompleteTraversal` and `CompleteAllTraversals` also classify a late completion as Cancelled when path following has already left that link. Mantle cancellation restores the previous Character Movement mode; Jump stops Omni tracking without claiming ownership of the newer path-following state.
+Traversal cleanup now calls `FinishUsingCustomLink()` only while that traversal still owns Unreal's current custom link, so stale Jump/Mantle/Custom cleanup cannot accidentally advance a newer move. Custom `CompleteTraversal` and `CompleteAllTraversals` also classify a late completion as Cancelled when path following has already left that link. Mantle cancellation restores the previous Character Movement mode; Jump cancellation restores its captured pre-jump movement mode and clears pending/applied launch velocity without aborting the newer path-following request.
 
 The 0.63 relevant-NavData filtering and 0.62 Supported Agents hardening remain intact, as does the 0.61 runtime Custom smart-link enabled-state override.
 
@@ -95,9 +97,9 @@ See `Doc/Directional-Traversal-Test-Plan.md` for the dedicated test pass.
 
 Set **Traversal Action = Custom** when Omni should provide navigation connectivity but your game should perform the physical movement. Custom is intended for animation-driven mantle, climb, teleport, launch pads, doors, ziplines, scripted animation, or other project-specific traversal.
 
-Each Omni authoring actor exposes an internal **Custom Traversal** component. For new work, bind to **On Traversal Requested Detailed** in Blueprint or C++. The request includes the designer-authored Traversal ID, exact Source/Target direction, owning Omni actor, actual Pawn start, runtime destination, and authored/projected Source and Target endpoints. The original four-parameter **On Traversal Requested** event remains available for compact or existing bindings.
+Each Omni authoring actor exposes an internal **Custom Traversal** component. For Blueprint, bind to **On Traversal Requested Detailed**. C++ can use the same dynamic event or the native **OnTraversalRequestedNative** multicast delegate, which supports ordinary native delegates and lambdas without requiring a UFUNCTION receiver. The request includes the designer-authored Traversal ID, exact Source/Target direction, owning Omni actor, actual Pawn start, runtime destination, and authored/projected Source and Target endpoints. The original four-parameter **On Traversal Requested** event remains available for compact or existing bindings.
 
-Move the Pawn using your own logic, then call **Complete Custom Traversal** on the same Custom Traversal component with the Request Id. Omni releases the smart link and normal path following resumes. **On Traversal Finished** reports whether that request Completed, Timed Out, was Cancelled by regeneration/cleanup, or was released because no request listener was bound.
+Move the Pawn using your own logic, then call **Complete Custom Traversal** on the same Custom Traversal component with the Request Id. Omni releases the smart link and normal path following resumes. **On Traversal Finished** reports whether that request Completed, Timed Out, was Cancelled by regeneration/cleanup, or was released because no request listener was bound. C++ can receive the same finish payload through **OnTraversalFinishedNative**.
 
 **Custom Traversal Timeout** defaults to 5 seconds and prevents a forgotten completion call from holding path following forever. If no listener is bound when the AI reaches the link, Omni releases the link immediately rather than deadlocking the path follower.
 

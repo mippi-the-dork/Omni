@@ -139,7 +139,7 @@ void UOmniJumpTraversalComponent::ClearLinks()
 {
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
     {
-        FinishTraversalAtIndex(Index);
+        FinishTraversalAtIndex(Index, true);
     }
 
     if (AActor* Owner = GetOwner())
@@ -181,7 +181,7 @@ void UOmniJumpTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponent*
     {
         if (ActiveTraversals[Index].PathFollowing.Get() == PathFollowing)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, true);
         }
     }
 
@@ -190,6 +190,9 @@ void UOmniJumpTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponent*
         : 0.0f;
     const FVector CharacterDestination = DestinationPoint + FVector(0.0, 0.0, CapsuleHalfHeight);
     const FVector LaunchVelocity = CalculateLaunchVelocity(*Character, CharacterDestination);
+    UCharacterMovementComponent* Movement = Character->GetCharacterMovement();
+    const uint8 PreviousMovementMode = static_cast<uint8>(Movement->MovementMode);
+    const uint8 PreviousCustomMovementMode = Movement->CustomMovementMode;
     Character->LaunchCharacter(LaunchVelocity, true, true);
 
     FActiveJumpTraversal& Traversal = ActiveTraversals.Emplace_GetRef();
@@ -198,6 +201,8 @@ void UOmniJumpTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponent*
     Traversal.Link = LinkComp;
     Traversal.Destination = CharacterDestination;
     Traversal.ElapsedTime = 0.0f;
+    Traversal.PreviousMovementMode = PreviousMovementMode;
+    Traversal.PreviousCustomMovementMode = PreviousCustomMovementMode;
 
     SetComponentTickEnabled(true);
 }
@@ -215,7 +220,7 @@ void UOmniJumpTraversalComponent::TickComponent(float DeltaTime, ELevelTick Tick
 
         if (!PathFollowing || !Character || !Link)
         {
-            ActiveTraversals.RemoveAtSwap(Index);
+            FinishTraversalAtIndex(Index, true);
             continue;
         }
 
@@ -224,7 +229,7 @@ void UOmniJumpTraversalComponent::TickComponent(float DeltaTime, ELevelTick Tick
         // still reports this exact generated smart link as the active custom link.
         if (PathFollowing->GetCurrentCustomLinkOb() != Link)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, true);
             continue;
         }
 
@@ -242,7 +247,7 @@ void UOmniJumpTraversalComponent::TickComponent(float DeltaTime, ELevelTick Tick
 
         if ((bNearDestination && bDescendingOrGrounded) || bTimedOut)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, false);
         }
     }
 
@@ -252,7 +257,7 @@ void UOmniJumpTraversalComponent::TickComponent(float DeltaTime, ELevelTick Tick
     }
 }
 
-void UOmniJumpTraversalComponent::FinishTraversalAtIndex(int32 Index)
+void UOmniJumpTraversalComponent::FinishTraversalAtIndex(int32 Index, bool bRestorePreJumpMovement)
 {
     if (!ActiveTraversals.IsValidIndex(Index))
     {
@@ -261,6 +266,27 @@ void UOmniJumpTraversalComponent::FinishTraversalAtIndex(int32 Index)
 
     FActiveJumpTraversal Traversal = ActiveTraversals[Index];
     ActiveTraversals.RemoveAtSwap(Index);
+
+    if (bRestorePreJumpMovement)
+    {
+        if (ACharacter* Character = Traversal.Character.Get())
+        {
+            if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
+            {
+                // LaunchCharacter() forces CharacterMovement into Falling. If the
+                // MoveTo that owned this jump is replaced or aborted, that ballistic
+                // state belongs to the stale request and must not leak into the new
+                // path. Clear both the not-yet-consumed launch and any velocity it
+                // already applied without aborting the replacement request, then
+                // restore the movement mode that existed before the jump began.
+                Movement->PendingLaunchVelocity = FVector::ZeroVector;
+                Movement->StopMovementKeepPathing();
+                Movement->SetMovementMode(
+                    static_cast<EMovementMode>(Traversal.PreviousMovementMode),
+                    Traversal.PreviousCustomMovementMode);
+            }
+        }
+    }
 
     if (UPathFollowingComponent* PathFollowing = Traversal.PathFollowing.Get())
     {
@@ -287,7 +313,7 @@ void UOmniJumpTraversalComponent::FinishTraversalsForLink(UNavLinkCustomComponen
     {
         if (ActiveTraversals[Index].Link.Get() == LinkComp)
         {
-            FinishTraversalAtIndex(Index);
+            FinishTraversalAtIndex(Index, true);
         }
     }
 }

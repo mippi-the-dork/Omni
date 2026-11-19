@@ -214,7 +214,12 @@ void UOmniMantleTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponen
     Traversal.PreviousMovementMode = static_cast<uint8>(Movement->MovementMode);
     Traversal.PreviousCustomMovementMode = Movement->CustomMovementMode;
 
-    Movement->StopMovementImmediately();
+    // Preserve the MoveTo request that owns this custom link.
+    // StopMovementImmediately() routes through nav movement's StopActiveMovement
+    // path and, with the default abort policy, reports MovementStop back to
+    // PathFollowing. Mantle needs to clear residual velocity without aborting
+    // the request, then return control explicitly through FinishUsingCustomLink().
+    Movement->StopMovementKeepPathing();
     Movement->SetMovementMode(MOVE_Flying);
     SetComponentTickEnabled(true);
 }

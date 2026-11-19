@@ -1,11 +1,22 @@
 #include "OmniPointNavLink.h"
 #include "OmniSplineNavLink.h"
 #include "OmniVolumeNavLink.h"
+#include "OmniCustomTraversalComponent.h"
+#include "OmniJumpTraversalComponent.h"
+#include "OmniMantleTraversalComponent.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "ActorFactories/ActorFactory.h"
 #include "AIController.h"
+#include "BehaviorTree/BehaviorTree.h"
+#include "BehaviorTree/BehaviorTreeComponent.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "BehaviorTree/BlackboardData.h"
+#include "BehaviorTree/Blackboard/BlackboardKeyType_Vector.h"
+#include "BehaviorTree/Composites/BTComposite_Sequence.h"
+#include "BehaviorTree/Tasks/BTTask_BlackboardBase.h"
+#include "BehaviorTree/Tasks/BTTask_MoveTo.h"
 #include "AI/Navigation/NavigationTypes.h"
 #include "AI/NavigationSystemBase.h"
 #include "Builders/CubeBuilder.h"
@@ -28,6 +39,7 @@
 #include "HAL/PlatformProcess.h"
 #include "Misc/AutomationTest.h"
 #include "NavLinkComponent.h"
+#include "NavLinkCustomInterface.h"
 #include "NavMesh/NavMeshBoundsVolume.h"
 #include "NavMesh/RecastNavMesh.h"
 #include "NavigationData.h"
@@ -258,12 +270,26 @@ namespace OmniNavigationAutomation
         UCharacterMovementComponent* Movement = nullptr;
     };
 
+    struct FBehaviorTreeMoveToHarness
+    {
+        UBehaviorTree* Tree = nullptr;
+        UBlackboardData* BlackboardData = nullptr;
+        UBlackboardComponent* Blackboard = nullptr;
+        UBehaviorTreeComponent* BehaviorTree = nullptr;
+        UBTTask_MoveTo* MoveTask = nullptr;
+        FName GoalKey = TEXT("OmniGoal");
+    };
+
     class FScopedNavigationWorld
     {
     public:
-        explicit FScopedNavigationWorld(FAutomationTestBase& InTest, bool bInConfigureTwoAgents = false)
+        explicit FScopedNavigationWorld(
+            FAutomationTestBase& InTest,
+            bool bInConfigureTwoAgents = false,
+            bool bInCreateAISystem = false)
             : Test(InTest)
             , bConfigureTwoAgents(bInConfigureTwoAgents)
+            , bCreateAISystem(bInCreateAISystem)
         {
             static int32 WorldCounter = 0;
             const FName WorldName(*FString::Printf(TEXT("OmniNavigationAutomationWorld_%d"), ++WorldCounter));
@@ -271,7 +297,7 @@ namespace OmniNavigationAutomation
             UWorld::InitializationValues InitValues;
             InitValues
                 .AllowAudioPlayback(false)
-                .CreateAISystem(false)
+                .CreateAISystem(bCreateAISystem)
                 .CreateFXSystem(false)
                 .CreateNavigation(true)
                 .CreatePhysicsScene(true)
@@ -913,7 +939,10 @@ namespace OmniNavigationAutomation
             return true;
         }
 
-        bool SpawnCharacterMoveToHarness(const FVector& NavStart, FCharacterMoveToHarness& OutHarness)
+        bool SpawnCharacterMoveToHarness(
+            const FVector& NavStart,
+            FCharacterMoveToHarness& OutHarness,
+            float InGravityScale = 0.0f)
         {
             OutHarness = FCharacterMoveToHarness();
 
@@ -969,7 +998,7 @@ namespace OmniNavigationAutomation
             Movement->SetUpdatedComponent(Capsule);
             Movement->Activate(true);
             Movement->NavAgentProps = static_cast<const FNavAgentProperties&>(AgentConfig);
-            Movement->GravityScale = 0.0f;
+            Movement->GravityScale = InGravityScale;
             Movement->MaxFlySpeed = 600.0f;
             Movement->BrakingDecelerationFlying = 2048.0f;
             Movement->StopMovementImmediately();
@@ -1051,6 +1080,185 @@ namespace OmniNavigationAutomation
             return true;
         }
 
+        bool StartBehaviorTreeMoveTo(
+            const FCharacterMoveToHarness& MoveHarness,
+            const FVector& Goal,
+            FBehaviorTreeMoveToHarness& OutHarness,
+            bool bObserveBlackboardValue = true)
+        {
+            OutHarness = FBehaviorTreeMoveToHarness();
+
+            if (!IsReady() || !MoveHarness.Controller || !MoveHarness.PathFollowing)
+            {
+                return false;
+            }
+
+            OutHarness.BlackboardData = NewObject<UBlackboardData>(
+                GetTransientPackage(),
+                NAME_None,
+                RF_Transient);
+            if (!OutHarness.BlackboardData)
+            {
+                Test.AddError(TEXT("Failed to create transient Omni Behavior Tree blackboard data."));
+                return false;
+            }
+
+            FBlackboardEntry GoalEntry;
+            GoalEntry.EntryName = OutHarness.GoalKey;
+            GoalEntry.KeyType = NewObject<UBlackboardKeyType_Vector>(OutHarness.BlackboardData, NAME_None, RF_Transient);
+            if (!GoalEntry.KeyType)
+            {
+                Test.AddError(TEXT("Failed to create the Omni Behavior Tree vector blackboard key type."));
+                return false;
+            }
+
+            OutHarness.BlackboardData->Keys.Add(GoalEntry);
+            OutHarness.BlackboardData->UpdateKeyIDs();
+
+            OutHarness.Tree = NewObject<UBehaviorTree>(
+                GetTransientPackage(),
+                NAME_None,
+                RF_Transient);
+            if (!OutHarness.Tree)
+            {
+                Test.AddError(TEXT("Failed to create transient Omni Behavior Tree asset."));
+                return false;
+            }
+            OutHarness.Tree->BlackboardAsset = OutHarness.BlackboardData;
+
+            UBTComposite_Sequence* Root = NewObject<UBTComposite_Sequence>(
+                OutHarness.Tree,
+                NAME_None,
+                RF_Transient);
+            OutHarness.MoveTask = NewObject<UBTTask_MoveTo>(
+                Root,
+                NAME_None,
+                RF_Transient);
+            if (!Root || !OutHarness.MoveTask)
+            {
+                Test.AddError(TEXT("Failed to create the Omni Behavior Tree Move To nodes."));
+                return false;
+            }
+
+            FBlackboardKeySelector GoalSelector;
+            GoalSelector.SelectedKeyName = OutHarness.GoalKey;
+            GoalSelector.SelectedKeyType = UBlackboardKeyType_Vector::StaticClass();
+            GoalSelector.ResolveSelectedKey(*OutHarness.BlackboardData);
+            if (GoalSelector.GetSelectedKeyID() == FBlackboard::InvalidKey)
+            {
+                Test.AddError(TEXT("Failed to resolve the Omni Behavior Tree Move To blackboard key."));
+                return false;
+            }
+
+            FStructProperty* BlackboardKeyProperty = FindFProperty<FStructProperty>(
+                UBTTask_BlackboardBase::StaticClass(),
+                TEXT("BlackboardKey"));
+            if (!BlackboardKeyProperty)
+            {
+                Test.AddError(TEXT("Could not resolve UBTTask_BlackboardBase.BlackboardKey for the Omni Behavior Tree fixture."));
+                return false;
+            }
+
+            void* BlackboardKeyValue = BlackboardKeyProperty->ContainerPtrToValuePtr<void>(OutHarness.MoveTask);
+            BlackboardKeyProperty->CopyCompleteValue(BlackboardKeyValue, &GoalSelector);
+            OutHarness.MoveTask->bObserveBlackboardValue = bObserveBlackboardValue;
+
+            FBTCompositeChild Child;
+            Child.ChildTask = OutHarness.MoveTask;
+            Root->Children.Add(MoveTemp(Child));
+            OutHarness.Tree->RootNode = Root;
+
+            UBlackboardComponent* Blackboard = nullptr;
+            if (!MoveHarness.Controller->UseBlackboard(OutHarness.BlackboardData, Blackboard) || !Blackboard)
+            {
+                Test.AddError(TEXT("AAIController::UseBlackboard failed for the Omni Behavior Tree fixture."));
+                return false;
+            }
+            OutHarness.Blackboard = Blackboard;
+            if (OutHarness.Blackboard->GetBlackboardAsset() != OutHarness.BlackboardData)
+            {
+                Test.AddError(TEXT("Omni Behavior Tree fixture BlackboardComponent did not initialize with the requested transient data asset."));
+                return false;
+            }
+
+            OutHarness.Blackboard->SetValueAsVector(OutHarness.GoalKey, Goal);
+            if (!OutHarness.Blackboard->GetValueAsVector(OutHarness.GoalKey).Equals(Goal, KINDA_SMALL_NUMBER))
+            {
+                Test.AddError(TEXT("Omni Behavior Tree fixture failed to write/read the Move To goal blackboard key before tree start."));
+                return false;
+            }
+
+            // In a normal gameplay world UBrainComponent::InitializeComponent()
+            // discovers the owner's BlackboardComponent and caches it before BT
+            // execution. This transient automation world creates the brain late,
+            // after actor initialization, so RegisterComponent() alone does not
+            // guarantee that initialization-time relationship exists before
+            // UBTTask_MoveTo::ExecuteTask(). Establish the same stock relationship
+            // explicitly rather than letting the task run with BlackboardComp=null.
+            UBehaviorTreeComponent* BehaviorTree = Cast<UBehaviorTreeComponent>(MoveHarness.Controller->BrainComponent.Get());
+            if (!BehaviorTree)
+            {
+                if (MoveHarness.Controller->BrainComponent)
+                {
+                    Test.AddError(FString::Printf(
+                        TEXT("Omni Behavior Tree fixture found an unexpected existing BrainComponent of type %s."),
+                        *GetNameSafe(MoveHarness.Controller->BrainComponent->GetClass())));
+                    return false;
+                }
+
+                BehaviorTree = NewObject<UBehaviorTreeComponent>(
+                    MoveHarness.Controller,
+                    TEXT("OmniBehaviorTreeComponent"),
+                    RF_Transient);
+                if (!BehaviorTree)
+                {
+                    Test.AddError(TEXT("Failed to create the Omni Behavior Tree component."));
+                    return false;
+                }
+
+                BehaviorTree->RegisterComponent();
+                MoveHarness.Controller->BrainComponent = BehaviorTree;
+            }
+
+            BehaviorTree->CacheBlackboardComponent(OutHarness.Blackboard);
+            OutHarness.Blackboard->CacheBrainComponent(*BehaviorTree);
+
+            if (BehaviorTree->GetBlackboardComponent() != OutHarness.Blackboard)
+            {
+                Test.AddError(TEXT("Omni Behavior Tree fixture failed to cache the BlackboardComponent on the brain before tree start."));
+                return false;
+            }
+
+            if (OutHarness.Blackboard->GetBrainComponent() != BehaviorTree)
+            {
+                Test.AddError(TEXT("Omni Behavior Tree fixture failed to cache the BehaviorTreeComponent on the Blackboard before tree start."));
+                return false;
+            }
+
+            if (!MoveHarness.Controller->RunBehaviorTree(OutHarness.Tree))
+            {
+                Test.AddError(TEXT("AAIController::RunBehaviorTree failed for the Omni transient Move To tree."));
+                return false;
+            }
+
+            OutHarness.BehaviorTree = Cast<UBehaviorTreeComponent>(MoveHarness.Controller->BrainComponent.Get());
+            if (!OutHarness.BehaviorTree)
+            {
+                Test.AddError(TEXT("Omni Behavior Tree fixture did not retain a UBehaviorTreeComponent on the AIController."));
+                return false;
+            }
+
+            if (OutHarness.BehaviorTree != BehaviorTree
+                || OutHarness.BehaviorTree->GetBlackboardComponent() != OutHarness.Blackboard)
+            {
+                Test.AddError(TEXT("Omni Behavior Tree fixture lost its Brain/Blackboard association while starting the tree."));
+                return false;
+            }
+
+            OutHarness.BehaviorTree->SetComponentTickEnabled(true);
+            return true;
+        }
+
         EPathFollowingRequestResult::Type RequestCharacterMoveTo(
             const FCharacterMoveToHarness& Harness,
             const FVector& Goal) const
@@ -1071,14 +1279,13 @@ namespace OmniNavigationAutomation
                 false);
         }
 
-        bool WaitForCharacterMoveToCompletion(
+        bool AdvanceCharacterMoveToUntilCustomLink(
             const FCharacterMoveToHarness& Harness,
-            bool& bOutReachedGoal,
-            bool& bOutObservedNavigationLinkSegment,
-            double TimeoutSeconds = 5.0)
+            UObject*& OutCustomLink,
+            double TimeoutSeconds = 3.0,
+            UActorComponent* PrePathTickComponent = nullptr)
         {
-            bOutReachedGoal = false;
-            bOutObservedNavigationLinkSegment = false;
+            OutCustomLink = nullptr;
 
             if (!World
                 || !NavigationSystem
@@ -1089,6 +1296,97 @@ namespace OmniNavigationAutomation
                 return false;
             }
 
+            const int32 MaxTicks = FMath::Max(
+                1,
+                static_cast<int32>(TimeoutSeconds / static_cast<double>(TestTickSeconds)) + 1);
+
+            for (int32 TickIndex = 0; TickIndex < MaxTicks; ++TickIndex)
+            {
+                if (UObject* CurrentCustomLink = Harness.PathFollowing->GetCurrentCustomLinkOb())
+                {
+                    OutCustomLink = CurrentCustomLink;
+                    return true;
+                }
+
+                World->Tick(LEVELTICK_TimeOnly, TestTickSeconds);
+                NavigationSystem->ProcessPendingOctreeUpdates();
+
+                if (PrePathTickComponent && PrePathTickComponent->IsComponentTickEnabled())
+                {
+                    PrePathTickComponent->TickComponent(
+                        TestTickSeconds,
+                        LEVELTICK_All,
+                        &PrePathTickComponent->PrimaryComponentTick);
+                }
+
+                Harness.PathFollowing->TickComponent(
+                    TestTickSeconds,
+                    LEVELTICK_All,
+                    &Harness.PathFollowing->PrimaryComponentTick);
+
+                if (UObject* CurrentCustomLink = Harness.PathFollowing->GetCurrentCustomLinkOb())
+                {
+                    OutCustomLink = CurrentCustomLink;
+                    return true;
+                }
+
+                if (Harness.PathFollowing->GetStatus() == EPathFollowingStatus::Idle)
+                {
+                    Test.AddError(FString::Printf(
+                        TEXT("Omni MoveTo became Idle before reaching a custom navigation link. Final=%s."),
+                        *Harness.Character->GetActorLocation().ToCompactString()));
+                    return false;
+                }
+
+                Harness.Movement->TickComponent(
+                    TestTickSeconds,
+                    LEVELTICK_All,
+                    &Harness.Movement->PrimaryComponentTick);
+            }
+
+            Test.AddError(FString::Printf(
+                TEXT("Omni MoveTo did not reach a custom navigation link within %.2f synthetic seconds. Final=%s Status=%d."),
+                TimeoutSeconds,
+                *Harness.Character->GetActorLocation().ToCompactString(),
+                static_cast<int32>(Harness.PathFollowing->GetStatus())));
+            return false;
+        }
+
+        bool WaitForCharacterMoveToCompletion(
+            const FCharacterMoveToHarness& Harness,
+            bool& bOutReachedGoal,
+            bool& bOutObservedNavigationLinkSegment,
+            double TimeoutSeconds = 5.0,
+            UActorComponent* ExtraTickComponent = nullptr,
+            bool* bOutObservedCustomLink = nullptr,
+            FPathFollowingResult* OutCompletionResult = nullptr,
+            UActorComponent* SecondExtraTickComponent = nullptr)
+        {
+            bOutReachedGoal = false;
+            bOutObservedNavigationLinkSegment = false;
+            if (bOutObservedCustomLink)
+            {
+                *bOutObservedCustomLink = false;
+            }
+
+            if (!World
+                || !NavigationSystem
+                || !Harness.Character
+                || !Harness.PathFollowing
+                || !Harness.Movement)
+            {
+                return false;
+            }
+
+            bool bObservedCompletionResult = false;
+            FPathFollowingResult CompletionResult;
+            const FDelegateHandle CompletionHandle = Harness.PathFollowing->OnRequestFinished.AddLambda(
+                [&](FAIRequestID RequestId, const FPathFollowingResult& Result)
+                {
+                    CompletionResult = Result;
+                    bObservedCompletionResult = true;
+                });
+
             const FVector StartLocation = Harness.Character->GetActorLocation();
             const int32 MaxTicks = FMath::Max(
                 1,
@@ -1097,6 +1395,10 @@ namespace OmniNavigationAutomation
             for (int32 TickIndex = 0; TickIndex < MaxTicks; ++TickIndex)
             {
                 bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+                if (bOutObservedCustomLink)
+                {
+                    *bOutObservedCustomLink |= Harness.PathFollowing->GetCurrentCustomLinkOb() != nullptr;
+                }
 
                 // FScopedEditorWorld is intentionally used by the native-navigation
                 // fixture because it gives us deterministic transient Recast setup
@@ -1120,34 +1422,117 @@ namespace OmniNavigationAutomation
                     &Harness.PathFollowing->PrimaryComponentTick);
 
                 bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+                if (bOutObservedCustomLink)
+                {
+                    *bOutObservedCustomLink |= Harness.PathFollowing->GetCurrentCustomLinkOb() != nullptr;
+                }
 
                 Harness.Movement->TickComponent(
                     TestTickSeconds,
                     LEVELTICK_All,
                     &Harness.Movement->PrimaryComponentTick);
 
+                if (ExtraTickComponent && ExtraTickComponent->IsComponentTickEnabled())
+                {
+                    ExtraTickComponent->TickComponent(
+                        TestTickSeconds,
+                        LEVELTICK_All,
+                        &ExtraTickComponent->PrimaryComponentTick);
+                }
+
+                if (SecondExtraTickComponent && SecondExtraTickComponent->IsComponentTickEnabled())
+                {
+                    SecondExtraTickComponent->TickComponent(
+                        TestTickSeconds,
+                        LEVELTICK_All,
+                        &SecondExtraTickComponent->PrimaryComponentTick);
+                }
+
                 bOutObservedNavigationLinkSegment |= Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+                if (bOutObservedCustomLink)
+                {
+                    *bOutObservedCustomLink |= Harness.PathFollowing->GetCurrentCustomLinkOb() != nullptr;
+                }
 
                 if (Harness.PathFollowing->GetStatus() == EPathFollowingStatus::Idle)
                 {
                     bOutReachedGoal = Harness.PathFollowing->DidMoveReachGoal();
+                    Harness.PathFollowing->OnRequestFinished.Remove(CompletionHandle);
+                    if (OutCompletionResult && bObservedCompletionResult)
+                    {
+                        *OutCompletionResult = CompletionResult;
+                    }
                     return true;
                 }
             }
 
+            Harness.PathFollowing->OnRequestFinished.Remove(CompletionHandle);
+            if (OutCompletionResult && bObservedCompletionResult)
+            {
+                *OutCompletionResult = CompletionResult;
+            }
+
             Test.AddError(FString::Printf(
-                TEXT("Omni AI MoveTo timed out after %.2f synthetic seconds. Start=%s Final=%s Status=%d ReachedGoal=%d ObservedNavLink=%d Velocity=%s MovementMode=%d PathFollowingTickRegistered=%d MovementTickRegistered=%d."),
+                TEXT("Omni AI MoveTo timed out after %.2f synthetic seconds. Start=%s Final=%s Status=%d ReachedGoal=%d ObservedNavLink=%d ObservedCustomLink=%d CurrentCustomLink=%s Velocity=%s MovementMode=%d PathFollowingTickRegistered=%d MovementTickRegistered=%d ExtraTickEnabled=%d SecondExtraTickEnabled=%d."),
                 TimeoutSeconds,
                 *StartLocation.ToCompactString(),
                 *Harness.Character->GetActorLocation().ToCompactString(),
                 static_cast<int32>(Harness.PathFollowing->GetStatus()),
                 Harness.PathFollowing->DidMoveReachGoal() ? 1 : 0,
                 bOutObservedNavigationLinkSegment ? 1 : 0,
+                bOutObservedCustomLink && *bOutObservedCustomLink ? 1 : 0,
+                *GetNameSafe(Harness.PathFollowing->GetCurrentCustomLinkOb()),
                 *Harness.Movement->Velocity.ToCompactString(),
                 static_cast<int32>(Harness.Movement->MovementMode),
                 Harness.PathFollowing->PrimaryComponentTick.IsTickFunctionRegistered() ? 1 : 0,
-                Harness.Movement->PrimaryComponentTick.IsTickFunctionRegistered() ? 1 : 0));
+                Harness.Movement->PrimaryComponentTick.IsTickFunctionRegistered() ? 1 : 0,
+                ExtraTickComponent && ExtraTickComponent->IsComponentTickEnabled() ? 1 : 0,
+                SecondExtraTickComponent && SecondExtraTickComponent->IsComponentTickEnabled() ? 1 : 0));
             return false;
+        }
+
+        FString DescribeCurrentPath(const FCharacterMoveToHarness& Harness) const
+        {
+            if (!Harness.PathFollowing)
+            {
+                return TEXT("PathFollowing=null");
+            }
+
+            const FNavPathSharedPtr Path = Harness.PathFollowing->GetPath();
+            if (!Path.IsValid())
+            {
+                return TEXT("Path=null");
+            }
+
+            FString Description = FString::Printf(
+                TEXT("Path valid=%d partial=%d points=%d"),
+                Path->IsValid() ? 1 : 0,
+                Path->IsPartial() ? 1 : 0,
+                Path->GetPathPoints().Num());
+
+            const TArray<FNavPathPoint>& Points = Path->GetPathPoints();
+            for (int32 Index = 0; Index < Points.Num(); ++Index)
+            {
+                const FNavPathPoint& Point = Points[Index];
+                UObject* ResolvedLinkOwner = nullptr;
+                if (NavigationSystem && Point.CustomNavLinkId.IsValid())
+                {
+                    if (INavLinkCustomInterface* CustomLink = NavigationSystem->GetCustomLink(Point.CustomNavLinkId))
+                    {
+                        ResolvedLinkOwner = CustomLink->GetLinkOwner();
+                    }
+                }
+
+                Description += FString::Printf(
+                    TEXT(" | P%d=%s Flags=0x%08x CustomNavLinkId=%llu Resolved=%s"),
+                    Index,
+                    *Point.Location.ToCompactString(),
+                    Point.Flags,
+                    static_cast<unsigned long long>(Point.CustomNavLinkId.GetId()),
+                    *GetNameSafe(ResolvedLinkOwner));
+            }
+
+            return Description;
         }
 
         bool HasCompletePath(const FVector& Start, const FVector& End) const
@@ -1362,6 +1747,7 @@ namespace OmniNavigationAutomation
         bool bNavigationActorsInitialized = false;
         bool bInitialNavigationLifecycleTicked = false;
         bool bConfigureTwoAgents = false;
+        bool bCreateAISystem = false;
     };
 
     const FVector LeftQuery(-450.0, 0.0, 20.0);
@@ -2508,6 +2894,1178 @@ bool FOmniNavigationMoveToPointDisableRemovesPathTest::RunTest(const FString& Pa
     const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
     TestTrue(TEXT("AI MoveTo is rejected after the Omni Point is disabled"),
         RequestResult == EPathFollowingRequestResult::Failed);
+    return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalPointJumpMoveToTest,
+    "Omni.Navigation.Traversal.Point.JumpMoveTo",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalPointJumpMoveToTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Jump actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Jump;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->bValidateJumpPath = false;
+    Point->JumpApexHeight = 140.0f;
+    Point->JumpLandingTolerance = 100.0f;
+    Point->JumpTraversalTimeout = 3.0f;
+    Point->RegenerateLink();
+
+    TestEqual(TEXT("Point Jump emits no ordinary native links"), Point->NativeLinkCount, 0);
+    TestEqual(TEXT("Point Jump emits one generated smart link"), Point->JumpLinkCount, 1);
+    TestTrue(TEXT("Point Jump runtime traversal component owns the generated smart link"),
+        Point->JumpTraversal && Point->JumpTraversal->GetGeneratedLinkCount() == 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness, 1.0f))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Point Jump AI MoveTo starts through the generated smart link"),
+        RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    bool bObservedCustomLink = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Point->JumpTraversal,
+        &bObservedCustomLink);
+
+    TestTrue(TEXT("Point Jump AI MoveTo completes"), bCompleted);
+    TestTrue(TEXT("Point Jump AI MoveTo reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Point Jump path enters a navigation-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Point Jump PathFollowing hands ownership to the generated custom link"), bObservedCustomLink);
+    TestTrue(TEXT("Point Jump physically reaches the target island"),
+        Harness.Character && Harness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalSplineMantleMoveToTest,
+    "Omni.Navigation.Traversal.Spline.MantleMoveTo",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalSplineMantleMoveToTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniSplineLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Spline Mantle actor"), Spline))
+    {
+        return false;
+    }
+
+    Spline->TraversalAction = EOmniTraversalAction::Mantle;
+    Spline->bUseDirectionalTraversalActions = false;
+    Spline->bValidateMantlePath = false;
+    Spline->MantleDuration = 0.35f;
+    Spline->MantleArcHeight = 35.0f;
+    Spline->MantleLandingTolerance = 50.0f;
+    Spline->MantleTraversalTimeout = 2.0f;
+    Spline->RegenerateLinks();
+
+    TestEqual(TEXT("Spline Mantle emits no ordinary native links"), Spline->NativeLinkCount, 0);
+    TestEqual(TEXT("Spline Mantle emits one generated smart link"), Spline->MantleLinkCount, 1);
+    TestTrue(TEXT("Spline Mantle runtime traversal component owns the generated smart link"),
+        Spline->MantleTraversal && Spline->MantleTraversal->GetGeneratedLinkCount() == 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Spline Mantle AI MoveTo starts through the generated smart link"),
+        RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+    AddInfo(FString::Printf(TEXT("Spline Mantle requested path: %s"), *TestWorld.DescribeCurrentPath(Harness)));
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    bool bObservedCustomLink = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Spline->MantleTraversal,
+        &bObservedCustomLink,
+        &CompletionResult);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(
+            TEXT("Spline Mantle completion result: %s Final=%s MovementMode=%d"),
+            *CompletionResult.ToString(),
+            Harness.Character ? *Harness.Character->GetActorLocation().ToCompactString() : TEXT("null"),
+            Harness.Movement ? static_cast<int32>(Harness.Movement->MovementMode) : -1));
+    }
+
+    TestTrue(TEXT("Spline Mantle AI MoveTo completes"), bCompleted);
+    TestTrue(TEXT("Spline Mantle AI MoveTo reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Spline Mantle path enters a navigation-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Spline Mantle PathFollowing hands ownership to the generated custom link"), bObservedCustomLink);
+    TestTrue(TEXT("Spline Mantle physically reaches the target island"),
+        Harness.Character && Harness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalPointMantleControlTest,
+    "Omni.Navigation.Traversal.Point.MantleControl",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalPointMantleControlTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Mantle control actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Mantle;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->bValidateMantlePath = false;
+    Point->MantleDuration = 0.35f;
+    Point->MantleArcHeight = 35.0f;
+    Point->MantleLandingTolerance = 50.0f;
+    Point->MantleTraversalTimeout = 2.0f;
+    Point->RegenerateLink();
+
+    TestEqual(TEXT("Point Mantle control emits one generated smart link"), Point->MantleLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Point Mantle control MoveTo starts"), RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+    AddInfo(FString::Printf(TEXT("Point Mantle control requested path: %s"), *TestWorld.DescribeCurrentPath(Harness)));
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    bool bObservedCustomLink = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Point->MantleTraversal,
+        &bObservedCustomLink,
+        &CompletionResult);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Point Mantle control completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Point Mantle control completes"), bCompleted);
+    TestTrue(TEXT("Point Mantle control reaches goal"), bReachedGoal);
+    TestTrue(TEXT("Point Mantle control enters nav-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Point Mantle control hands off to custom link"), bObservedCustomLink);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalSplineJumpControlTest,
+    "Omni.Navigation.Traversal.Spline.JumpControl",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalSplineJumpControlTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniSplineLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Spline Jump control actor"), Spline))
+    {
+        return false;
+    }
+
+    Spline->TraversalAction = EOmniTraversalAction::Jump;
+    Spline->bUseDirectionalTraversalActions = false;
+    Spline->bValidateJumpPath = false;
+    Spline->JumpApexHeight = 140.0f;
+    Spline->JumpLandingTolerance = 100.0f;
+    Spline->JumpTraversalTimeout = 3.0f;
+    Spline->RegenerateLinks();
+
+    TestEqual(TEXT("Spline Jump control emits one generated smart link"), Spline->JumpLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness, 1.0f))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Spline Jump control MoveTo starts"), RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+    AddInfo(FString::Printf(TEXT("Spline Jump control requested path: %s"), *TestWorld.DescribeCurrentPath(Harness)));
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    bool bObservedCustomLink = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Spline->JumpTraversal,
+        &bObservedCustomLink,
+        &CompletionResult);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Spline Jump control completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Spline Jump control completes"), bCompleted);
+    TestTrue(TEXT("Spline Jump control reaches goal"), bReachedGoal);
+    TestTrue(TEXT("Spline Jump control enters nav-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Spline Jump control hands off to custom link"), bObservedCustomLink);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalVolumeCustomNoListenerMoveToTest,
+    "Omni.Navigation.Traversal.Volume.CustomNoListenerMoveTo",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalVolumeCustomNoListenerMoveToTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniVolumeNavLink* Volume = TestWorld.AddVolumeLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniVolumeLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Volume Custom actor"), Volume))
+    {
+        return false;
+    }
+
+    Volume->TraversalAction = EOmniTraversalAction::Custom;
+    Volume->bUseDirectionalTraversalActions = false;
+    Volume->CustomTraversalId = FName(TEXT("AutomationCustom"));
+    Volume->CustomTraversalTimeout = 1.0f;
+    Volume->RegenerateLinks();
+
+    TestEqual(TEXT("Volume Custom emits no ordinary native links"), Volume->NativeLinkCount, 0);
+    TestEqual(TEXT("Volume Custom emits one generated smart link"), Volume->CustomLinkCount, 1);
+    TestTrue(TEXT("Volume Custom runtime dispatcher owns the generated smart link"),
+        Volume->CustomTraversal && Volume->CustomTraversal->GetGeneratedLinkCount() == 1);
+    TestFalse(TEXT("Volume Custom test intentionally has no project traversal listener"),
+        Volume->CustomTraversal && (Volume->CustomTraversal->OnTraversalRequested.IsBound()
+            || Volume->CustomTraversal->OnTraversalRequestedDetailed.IsBound()
+            || Volume->CustomTraversal->OnTraversalRequestedNative.IsBound()));
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Volume Custom AI MoveTo starts through the generated smart link"),
+        RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Volume->CustomTraversal);
+
+    TestTrue(TEXT("Volume Custom no-listener safety release lets AI MoveTo complete"), bCompleted);
+    TestTrue(TEXT("Volume Custom no-listener safety release returns PathFollowing to the requested goal"), bReachedGoal);
+    TestTrue(TEXT("Volume Custom path enters a navigation-link segment"), bObservedNavigationLinkSegment);
+    TestEqual(TEXT("Volume Custom no-listener safety release leaves no active request"),
+        Volume->CustomTraversal ? Volume->CustomTraversal->GetActiveTraversalCount() : -1,
+        0);
+    TestTrue(TEXT("Volume Custom no-listener release does not deadlock movement on the source island"),
+        Harness.Character && Harness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalPointCustomBoundCompletionTest,
+    "Omni.Navigation.Traversal.Custom.BoundCompletion",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalPointCustomBoundCompletionTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Custom bound-completion actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Custom;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->CustomTraversalId = FName(TEXT("AutomationBoundCustom"));
+    Point->CustomTraversalTimeout = 2.0f;
+    Point->RegenerateLink();
+
+    UOmniCustomTraversalComponent* CustomTraversal = Point->CustomTraversal;
+    if (!TestNotNull(TEXT("Point Custom runtime dispatcher"), CustomTraversal))
+    {
+        return false;
+    }
+
+    TestEqual(TEXT("Point Custom emits one generated smart link"), Point->CustomLinkCount, 1);
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    int32 RequestCount = 0;
+    int32 FinishCount = 0;
+    bool bRequestObservedCurrentCustomLink = false;
+    bool bRequestObservedNavigationLinkSegment = false;
+    FOmniCustomTraversalRequest CapturedRequest;
+    EOmniCustomTraversalFinishReason CapturedFinishReason = EOmniCustomTraversalFinishReason::Cancelled;
+
+    const FDelegateHandle RequestHandle = CustomTraversal->OnTraversalRequestedNative.AddLambda(
+        [&](const FOmniCustomTraversalRequest& Request)
+        {
+            ++RequestCount;
+            CapturedRequest = Request;
+            bRequestObservedCurrentCustomLink = Harness.PathFollowing
+                && Harness.PathFollowing->GetCurrentCustomLinkOb() != nullptr;
+            bRequestObservedNavigationLinkSegment = Harness.PathFollowing
+                && Harness.PathFollowing->IsCurrentSegmentNavigationLink();
+
+            ACharacter* Character = Cast<ACharacter>(Request.Pawn.Get());
+            if (Character)
+            {
+                float CapsuleHalfHeight = 0.0f;
+                if (UCapsuleComponent* Capsule = Character->GetCapsuleComponent())
+                {
+                    CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+                }
+
+                Character->SetActorLocation(
+                    Request.Destination + FVector(0.0, 0.0, CapsuleHalfHeight),
+                    false,
+                    nullptr,
+                    ETeleportType::TeleportPhysics);
+
+                if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
+                {
+                    Movement->StopMovementKeepPathing();
+                }
+            }
+
+            CustomTraversal->CompleteTraversal(Request.RequestId);
+        });
+
+    const FDelegateHandle FinishHandle = CustomTraversal->OnTraversalFinishedNative.AddLambda(
+        [&](const FOmniCustomTraversalRequest&, EOmniCustomTraversalFinishReason Reason)
+        {
+            ++FinishCount;
+            CapturedFinishReason = Reason;
+        });
+
+    const EPathFollowingRequestResult::Type RequestResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Bound Point Custom AI MoveTo starts"), RequestResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        CustomTraversal);
+
+    CustomTraversal->OnTraversalRequestedNative.Remove(RequestHandle);
+    CustomTraversal->OnTraversalFinishedNative.Remove(FinishHandle);
+
+    TestTrue(TEXT("Bound Point Custom AI MoveTo completes"), bCompleted);
+    TestTrue(TEXT("Bound Point Custom AI MoveTo reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Bound Point Custom path enters a navigation-link segment"),
+        bObservedNavigationLinkSegment || bRequestObservedNavigationLinkSegment);
+    TestEqual(TEXT("Bound Point Custom request fires exactly once"), RequestCount, 1);
+    TestEqual(TEXT("Bound Point Custom finish fires exactly once"), FinishCount, 1);
+    TestTrue(TEXT("Bound Point Custom request fires while Unreal owns the generated custom link"), bRequestObservedCurrentCustomLink);
+    TestEqual(TEXT("Bound Point Custom completes explicitly"), CapturedFinishReason, EOmniCustomTraversalFinishReason::Completed);
+    TestEqual(TEXT("Bound Point Custom preserves authored traversal ID"), CapturedRequest.TraversalId, FName(TEXT("AutomationBoundCustom")));
+    TestEqual(TEXT("Bound Point Custom reports Source-to-Target direction"), CapturedRequest.Direction, EOmniTraversalDirection::SourceToTarget);
+    TestEqual(TEXT("Bound Point Custom leaves no active traversal"), CustomTraversal->GetActiveTraversalCount(), 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalJumpReplacementTest,
+    "Omni.Navigation.Traversal.Interruption.JumpReplacement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalJumpReplacementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Jump replacement actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Jump;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->bValidateJumpPath = false;
+    Point->JumpApexHeight = 140.0f;
+    Point->JumpLandingTolerance = 100.0f;
+    Point->JumpTraversalTimeout = 3.0f;
+    Point->RegenerateLink();
+
+    if (!TestNotNull(TEXT("Jump replacement runtime component"), Point->JumpTraversal.Get())
+        || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness, 1.0f))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type InitialResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Jump replacement initial MoveTo starts"), InitialResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    UObject* OldCustomLink = nullptr;
+    if (!TestWorld.AdvanceCharacterMoveToUntilCustomLink(Harness, OldCustomLink))
+    {
+        return false;
+    }
+
+    TestNotNull(TEXT("Jump replacement reaches generated custom link"), OldCustomLink);
+    TestEqual(TEXT("Jump replacement has one active Omni traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 1);
+
+    const EPathFollowingRequestResult::Type ReplacementResult = TestWorld.RequestCharacterMoveTo(Harness, LeftQuery);
+    TestTrue(TEXT("Jump replacement MoveTo starts while old traversal is active"), ReplacementResult == EPathFollowingRequestResult::RequestSuccessful);
+    TestTrue(TEXT("Jump replacement immediately leaves old custom-link ownership"), Harness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink);
+
+    Point->JumpTraversal->TickComponent(
+        TestTickSeconds,
+        LEVELTICK_All,
+        &Point->JumpTraversal->PrimaryComponentTick);
+
+    TestEqual(TEXT("Jump replacement drops stale traversal on the next Omni tick"), Point->JumpTraversal->GetActiveTraversalCount(), 0);
+    TestTrue(TEXT("Jump replacement restores the pre-jump movement mode"),
+        Harness.Movement && Harness.Movement->MovementMode == MOVE_Flying);
+    TestTrue(TEXT("Jump replacement clears stale ballistic velocity"),
+        Harness.Character && Harness.Character->GetVelocity().IsNearlyZero(1.0f));
+    TestTrue(TEXT("Jump replacement clears any pending launch velocity"),
+        Harness.Movement && Harness.Movement->PendingLaunchVelocity.IsNearlyZero(1.0f));
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Point->JumpTraversal,
+        nullptr,
+        &CompletionResult);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Jump replacement completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Jump replacement MoveTo completes"), bCompleted);
+    TestTrue(TEXT("Jump replacement MoveTo remains authoritative and reaches source-side goal"), bReachedGoal);
+    TestEqual(TEXT("Jump replacement leaves no stale traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 0);
+    TestTrue(TEXT("Jump replacement physically returns to the source island"), Harness.Character && Harness.Character->GetActorLocation().X < -250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalMantleReplacementTest,
+    "Omni.Navigation.Traversal.Interruption.MantleReplacement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalMantleReplacementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Mantle replacement actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Mantle;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->bValidateMantlePath = false;
+    Point->MantleDuration = 0.6f;
+    Point->MantleArcHeight = 35.0f;
+    Point->MantleLandingTolerance = 50.0f;
+    Point->MantleTraversalTimeout = 2.0f;
+    Point->RegenerateLink();
+
+    if (!TestNotNull(TEXT("Mantle replacement runtime component"), Point->MantleTraversal.Get())
+        || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    const EPathFollowingRequestResult::Type InitialResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Mantle replacement initial MoveTo starts"), InitialResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    UObject* OldCustomLink = nullptr;
+    if (!TestWorld.AdvanceCharacterMoveToUntilCustomLink(Harness, OldCustomLink))
+    {
+        return false;
+    }
+
+    TestEqual(TEXT("Mantle replacement has one active Omni traversal"), Point->MantleTraversal->GetActiveTraversalCount(), 1);
+    TestEqual(TEXT("Mantle replacement captured the fixture's previous Flying movement mode"), static_cast<EMovementMode>(Harness.Movement->MovementMode), MOVE_Flying);
+
+    // Make restoration observable. The traversal captured Flying before it took ownership.
+    // A replacement that arrives while another system has changed the current mode must
+    // still restore the mode captured at traversal entry, not preserve this temporary one.
+    Harness.Movement->SetMovementMode(MOVE_Walking);
+
+    const EPathFollowingRequestResult::Type ReplacementResult = TestWorld.RequestCharacterMoveTo(Harness, LeftQuery);
+    TestTrue(TEXT("Mantle replacement MoveTo starts while old traversal is active"), ReplacementResult == EPathFollowingRequestResult::RequestSuccessful);
+    TestTrue(TEXT("Mantle replacement immediately leaves old custom-link ownership"), Harness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink);
+
+    Point->MantleTraversal->TickComponent(
+        TestTickSeconds,
+        LEVELTICK_All,
+        &Point->MantleTraversal->PrimaryComponentTick);
+
+    TestEqual(TEXT("Mantle replacement drops stale traversal on the next Omni tick"), Point->MantleTraversal->GetActiveTraversalCount(), 0);
+    TestEqual(TEXT("Mantle replacement restores the movement mode captured before traversal"), static_cast<EMovementMode>(Harness.Movement->MovementMode), MOVE_Flying);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        Point->MantleTraversal,
+        nullptr,
+        &CompletionResult);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Mantle replacement completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Mantle replacement MoveTo completes"), bCompleted);
+    TestTrue(TEXT("Mantle replacement MoveTo remains authoritative and reaches source-side goal"), bReachedGoal);
+    TestEqual(TEXT("Mantle replacement leaves no stale traversal"), Point->MantleTraversal->GetActiveTraversalCount(), 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalCustomLateCompletionReplacementTest,
+    "Omni.Navigation.Traversal.Interruption.CustomLateCompletionReplacement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalCustomLateCompletionReplacementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Custom replacement actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Custom;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->CustomTraversalId = FName(TEXT("AutomationLateCompletion"));
+    Point->CustomTraversalTimeout = 3.0f;
+    Point->RegenerateLink();
+
+    UOmniCustomTraversalComponent* CustomTraversal = Point->CustomTraversal;
+    if (!TestNotNull(TEXT("Custom replacement runtime component"), CustomTraversal)
+        || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    int32 CapturedRequestId = INDEX_NONE;
+    int32 FinishCount = 0;
+    EOmniCustomTraversalFinishReason FinishReason = EOmniCustomTraversalFinishReason::Completed;
+
+    const FDelegateHandle RequestHandle = CustomTraversal->OnTraversalRequestedNative.AddLambda(
+        [&](const FOmniCustomTraversalRequest& Request)
+        {
+            CapturedRequestId = Request.RequestId;
+        });
+    const FDelegateHandle FinishHandle = CustomTraversal->OnTraversalFinishedNative.AddLambda(
+        [&](const FOmniCustomTraversalRequest&, EOmniCustomTraversalFinishReason Reason)
+        {
+            ++FinishCount;
+            FinishReason = Reason;
+        });
+
+    const EPathFollowingRequestResult::Type InitialResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Custom replacement initial MoveTo starts"), InitialResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    UObject* OldCustomLink = nullptr;
+    if (!TestWorld.AdvanceCharacterMoveToUntilCustomLink(Harness, OldCustomLink))
+    {
+        CustomTraversal->OnTraversalRequestedNative.Remove(RequestHandle);
+        CustomTraversal->OnTraversalFinishedNative.Remove(FinishHandle);
+        return false;
+    }
+
+    TestTrue(TEXT("Custom replacement captures a valid request ID"), CapturedRequestId != INDEX_NONE);
+    TestEqual(TEXT("Custom replacement has one active request before replacement"), CustomTraversal->GetActiveTraversalCount(), 1);
+
+    const EPathFollowingRequestResult::Type ReplacementResult = TestWorld.RequestCharacterMoveTo(Harness, LeftQuery);
+    TestTrue(TEXT("Custom replacement MoveTo starts while old traversal is active"), ReplacementResult == EPathFollowingRequestResult::RequestSuccessful);
+    TestTrue(TEXT("Custom replacement leaves old custom-link ownership before late completion"), Harness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink);
+
+    // Project code can finish one frame late. The old RequestId must be converted to
+    // cancellation and must never FinishUsingCustomLink() against the replacement move.
+    CustomTraversal->CompleteTraversal(CapturedRequestId);
+    CustomTraversal->CompleteTraversal(CapturedRequestId); // Duplicate late completion is a no-op.
+
+    TestEqual(TEXT("Custom late completion reports exactly one finish"), FinishCount, 1);
+    TestEqual(TEXT("Custom late completion reports Cancelled, not Completed"), FinishReason, EOmniCustomTraversalFinishReason::Cancelled);
+    TestEqual(TEXT("Custom late completion removes the stale request immediately"), CustomTraversal->GetActiveTraversalCount(), 0);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        CustomTraversal,
+        nullptr,
+        &CompletionResult);
+
+    CustomTraversal->OnTraversalRequestedNative.Remove(RequestHandle);
+    CustomTraversal->OnTraversalFinishedNative.Remove(FinishHandle);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Custom replacement completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Custom replacement MoveTo completes after stale project completion"), bCompleted);
+    TestTrue(TEXT("Custom replacement MoveTo remains authoritative and reaches source-side goal"), bReachedGoal);
+    TestEqual(TEXT("Custom replacement leaves no active request"), CustomTraversal->GetActiveTraversalCount(), 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationTraversalCustomExplicitAbortTest,
+    "Omni.Navigation.Traversal.Interruption.CustomExplicitAbort",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationTraversalCustomExplicitAbortTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Point Custom abort actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Custom;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->CustomTraversalId = FName(TEXT("AutomationAbort"));
+    Point->CustomTraversalTimeout = 3.0f;
+    Point->RegenerateLink();
+
+    UOmniCustomTraversalComponent* CustomTraversal = Point->CustomTraversal;
+    if (!TestNotNull(TEXT("Custom abort runtime component"), CustomTraversal)
+        || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness Harness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, Harness))
+    {
+        return false;
+    }
+
+    int32 FinishCount = 0;
+    EOmniCustomTraversalFinishReason FinishReason = EOmniCustomTraversalFinishReason::Completed;
+    const FDelegateHandle RequestHandle = CustomTraversal->OnTraversalRequestedNative.AddLambda(
+        [&](const FOmniCustomTraversalRequest&) {});
+    const FDelegateHandle FinishHandle = CustomTraversal->OnTraversalFinishedNative.AddLambda(
+        [&](const FOmniCustomTraversalRequest&, EOmniCustomTraversalFinishReason Reason)
+        {
+            ++FinishCount;
+            FinishReason = Reason;
+        });
+
+    const EPathFollowingRequestResult::Type InitialResult = TestWorld.RequestCharacterMoveTo(Harness, RightQuery);
+    TestTrue(TEXT("Custom abort initial MoveTo starts"), InitialResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    UObject* OldCustomLink = nullptr;
+    if (!TestWorld.AdvanceCharacterMoveToUntilCustomLink(Harness, OldCustomLink))
+    {
+        CustomTraversal->OnTraversalRequestedNative.Remove(RequestHandle);
+        CustomTraversal->OnTraversalFinishedNative.Remove(FinishHandle);
+        return false;
+    }
+
+    TestEqual(TEXT("Custom abort has one active request before StopMovement"), CustomTraversal->GetActiveTraversalCount(), 1);
+    Harness.Controller->StopMovement();
+
+    CustomTraversal->TickComponent(
+        TestTickSeconds,
+        LEVELTICK_All,
+        &CustomTraversal->PrimaryComponentTick);
+
+    TestEqual(TEXT("Custom abort cancels immediately on the next Omni tick"), CustomTraversal->GetActiveTraversalCount(), 0);
+    TestEqual(TEXT("Custom abort reports exactly one finish"), FinishCount, 1);
+    TestEqual(TEXT("Custom abort reports Cancelled"), FinishReason, EOmniCustomTraversalFinishReason::Cancelled);
+    TestTrue(TEXT("Custom abort leaves old custom-link ownership"), Harness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink);
+
+    Harness.Movement->StopMovementKeepPathing();
+    const EPathFollowingRequestResult::Type FollowupResult = TestWorld.RequestCharacterMoveTo(Harness, LeftQuery);
+    TestTrue(TEXT("Custom abort allows a subsequent MoveTo"), FollowupResult == EPathFollowingRequestResult::RequestSuccessful);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        Harness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        CustomTraversal);
+
+    CustomTraversal->OnTraversalRequestedNative.Remove(RequestHandle);
+    CustomTraversal->OnTraversalFinishedNative.Remove(FinishHandle);
+
+    TestTrue(TEXT("Custom post-abort MoveTo completes"), bCompleted);
+    TestTrue(TEXT("Custom post-abort MoveTo reaches its source-side goal"), bReachedGoal);
+    return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationBehaviorTreePointNativeMovementTest,
+    "Omni.Navigation.BehaviorTree.Point.NativeMovement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationBehaviorTreePointNativeMovementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this, false, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::BothWays);
+    if (!TestNotNull(TEXT("Omni Behavior Tree native Point actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::NativeMovement;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->RegenerateLink();
+
+    if (!TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness MoveHarness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, MoveHarness))
+    {
+        return false;
+    }
+
+    FBehaviorTreeMoveToHarness BTHarness;
+    if (!TestWorld.StartBehaviorTreeMoveTo(MoveHarness, RightQuery, BTHarness))
+    {
+        return false;
+    }
+
+    TestTrue(TEXT("Behavior Tree native Move To starts its tree"), BTHarness.BehaviorTree->TreeHasBeenStarted());
+    TestEqual(TEXT("Behavior Tree native Move To resolves the expected blackboard key"),
+        BTHarness.MoveTask->GetSelectedBlackboardKey(), BTHarness.GoalKey);
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        MoveHarness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        BTHarness.BehaviorTree,
+        nullptr,
+        &CompletionResult);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Behavior Tree native completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Behavior Tree native Move To completes"), bCompleted);
+    TestTrue(TEXT("Behavior Tree native Move To reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Behavior Tree native Move To crosses the authored navigation link"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Behavior Tree native Move To physically reaches the target island"), MoveHarness.Character->GetActorLocation().X > 250.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationBehaviorTreeSplineMantleMovementTest,
+    "Omni.Navigation.BehaviorTree.Spline.MantleMoveTo",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationBehaviorTreeSplineMantleMovementTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this, false, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniSplineNavLink* Spline = TestWorld.AddSplineLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniSplineLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Behavior Tree Mantle Spline actor"), Spline))
+    {
+        return false;
+    }
+
+    Spline->TraversalAction = EOmniTraversalAction::Mantle;
+    Spline->bUseDirectionalTraversalActions = false;
+    Spline->bValidateMantlePath = false;
+    Spline->MantleDuration = 0.35f;
+    Spline->MantleTraversalTimeout = 3.0f;
+    Spline->RegenerateLinks();
+
+    if (!TestNotNull(TEXT("Behavior Tree Mantle runtime component"), Spline->MantleTraversal.Get())
+        || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness MoveHarness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, MoveHarness))
+    {
+        return false;
+    }
+
+    FBehaviorTreeMoveToHarness BTHarness;
+    if (!TestWorld.StartBehaviorTreeMoveTo(MoveHarness, RightQuery, BTHarness))
+    {
+        return false;
+    }
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    bool bObservedCustomLink = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        MoveHarness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        BTHarness.BehaviorTree,
+        &bObservedCustomLink,
+        &CompletionResult,
+        Spline->MantleTraversal);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Behavior Tree Mantle completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Behavior Tree Mantle Move To completes"), bCompleted);
+    TestTrue(TEXT("Behavior Tree Mantle Move To reaches its requested goal"), bReachedGoal);
+    TestTrue(TEXT("Behavior Tree Mantle path enters a navigation-link segment"), bObservedNavigationLinkSegment);
+    TestTrue(TEXT("Behavior Tree Mantle hands ownership to the generated custom link"), bObservedCustomLink);
+    TestTrue(TEXT("Behavior Tree Mantle physically reaches the target island"), MoveHarness.Character->GetActorLocation().X > 250.0f);
+    TestEqual(TEXT("Behavior Tree Mantle leaves no active traversal"), Spline->MantleTraversal->GetActiveTraversalCount(), 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FOmniNavigationBehaviorTreeJumpObservedGoalRepathTest,
+    "Omni.Navigation.BehaviorTree.Point.JumpObservedGoalRepath",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FOmniNavigationBehaviorTreeJumpObservedGoalRepathTest::RunTest(const FString& Parameters)
+{
+    using namespace OmniNavigationAutomation;
+
+    FScopedNavigationWorld TestWorld(*this, false, true);
+    if (!TestWorld.IsReady() || !TestWorld.SetupTwoIslandFixture())
+    {
+        return false;
+    }
+
+    AOmniPointNavLink* Point = TestWorld.AddPointLink(
+        LeftLinkEndpoint,
+        RightLinkEndpoint,
+        EOmniPointLinkDirection::SourceToTarget);
+    if (!TestNotNull(TEXT("Omni Behavior Tree Jump repath actor"), Point))
+    {
+        return false;
+    }
+
+    Point->TraversalAction = EOmniTraversalAction::Jump;
+    Point->bUseDirectionalTraversalActions = false;
+    Point->bValidateJumpPath = false;
+    Point->JumpApexHeight = 140.0f;
+    Point->JumpLandingTolerance = 100.0f;
+    Point->JumpTraversalTimeout = 3.0f;
+    Point->RegenerateLink();
+
+    if (!TestNotNull(TEXT("Behavior Tree Jump repath runtime component"), Point->JumpTraversal.Get())
+        || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    FCharacterMoveToHarness MoveHarness;
+    if (!TestWorld.SpawnCharacterMoveToHarness(LeftQuery, MoveHarness, 1.0f))
+    {
+        return false;
+    }
+
+    FBehaviorTreeMoveToHarness BTHarness;
+    if (!TestWorld.StartBehaviorTreeMoveTo(MoveHarness, RightQuery, BTHarness, true))
+    {
+        return false;
+    }
+
+    UObject* OldCustomLink = nullptr;
+    if (!TestWorld.AdvanceCharacterMoveToUntilCustomLink(
+        MoveHarness,
+        OldCustomLink,
+        3.0,
+        BTHarness.BehaviorTree))
+    {
+        return false;
+    }
+
+    TestNotNull(TEXT("Behavior Tree Jump repath reaches the generated custom link"), OldCustomLink);
+    TestEqual(TEXT("Behavior Tree Jump repath has one active Omni traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 1);
+
+    // UBTTask_MoveTo observes this vector key. Retargeting it while the smart link
+    // owns path following must supersede the old traversal and keep the Behavior
+    // Tree task authoritative, rather than completing or aborting the stale Jump.
+    BTHarness.Blackboard->SetValueAsVector(BTHarness.GoalKey, LeftQuery);
+    BTHarness.BehaviorTree->TickComponent(
+        TestTickSeconds,
+        LEVELTICK_All,
+        &BTHarness.BehaviorTree->PrimaryComponentTick);
+
+    TestTrue(TEXT("Behavior Tree Jump repath leaves old custom-link ownership"),
+        MoveHarness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink);
+
+    Point->JumpTraversal->TickComponent(
+        TestTickSeconds,
+        LEVELTICK_All,
+        &Point->JumpTraversal->PrimaryComponentTick);
+
+    TestEqual(TEXT("Behavior Tree Jump repath drops stale traversal on the next Omni tick"),
+        Point->JumpTraversal->GetActiveTraversalCount(), 0);
+    TestEqual(TEXT("Behavior Tree Jump repath restores the pre-jump movement mode"),
+        static_cast<EMovementMode>(MoveHarness.Movement->MovementMode), MOVE_Flying);
+    TestTrue(TEXT("Behavior Tree Jump repath clears stale ballistic velocity"),
+        MoveHarness.Movement->Velocity.IsNearlyZero());
+    TestTrue(TEXT("Behavior Tree Jump repath clears any pending launch"),
+        MoveHarness.Movement->PendingLaunchVelocity.IsNearlyZero());
+
+    bool bReachedGoal = false;
+    bool bObservedNavigationLinkSegment = false;
+    FPathFollowingResult CompletionResult;
+    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
+        MoveHarness,
+        bReachedGoal,
+        bObservedNavigationLinkSegment,
+        5.0,
+        BTHarness.BehaviorTree,
+        nullptr,
+        &CompletionResult,
+        Point->JumpTraversal);
+
+    if (!bReachedGoal)
+    {
+        AddInfo(FString::Printf(TEXT("Behavior Tree Jump repath completion result: %s"), *CompletionResult.ToString()));
+    }
+
+    TestTrue(TEXT("Behavior Tree Jump repath completes"), bCompleted);
+    TestTrue(TEXT("Behavior Tree Jump repath reaches the updated source-side goal"), bReachedGoal);
+    TestTrue(TEXT("Behavior Tree Jump repath physically returns to the source island"), MoveHarness.Character->GetActorLocation().X < -250.0f);
+    TestEqual(TEXT("Behavior Tree Jump repath leaves no stale traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 0);
     return true;
 }
 
