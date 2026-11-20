@@ -51,6 +51,7 @@
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UnrealType.h"
+#include "TimerManager.h"
 
 namespace OmniNavigationAutomation
 {
@@ -1489,6 +1490,61 @@ namespace OmniNavigationAutomation
                 ExtraTickComponent && ExtraTickComponent->IsComponentTickEnabled() ? 1 : 0,
                 SecondExtraTickComponent && SecondExtraTickComponent->IsComponentTickEnabled() ? 1 : 0));
             return false;
+        }
+
+        void TickCharacterMoveToSyntheticFrame(
+            const FCharacterMoveToHarness& Harness,
+            UActorComponent* ExtraTickComponent = nullptr,
+            UActorComponent* SecondExtraTickComponent = nullptr,
+            bool bTickGameplayTimers = false)
+        {
+            if (!World
+                || !NavigationSystem
+                || !Harness.PathFollowing
+                || !Harness.Movement)
+            {
+                return;
+            }
+
+            World->Tick(LEVELTICK_TimeOnly, TestTickSeconds);
+
+            // LEVELTICK_TimeOnly deliberately skips FTimerManager in UWorld::Tick().
+            // Stock UAITask_MoveTo defers blackboard-observed retargeting while a
+            // nav-link move is active by scheduling ConditionalPerformMove() on a
+            // gameplay timer. Behavior Tree integration tests that exercise that
+            // policy must advance the timer explicitly in this synthetic world.
+            if (bTickGameplayTimers)
+            {
+                World->GetTimerManager().Tick(TestTickSeconds);
+            }
+
+            NavigationSystem->ProcessPendingOctreeUpdates();
+
+            Harness.PathFollowing->TickComponent(
+                TestTickSeconds,
+                LEVELTICK_All,
+                &Harness.PathFollowing->PrimaryComponentTick);
+
+            Harness.Movement->TickComponent(
+                TestTickSeconds,
+                LEVELTICK_All,
+                &Harness.Movement->PrimaryComponentTick);
+
+            if (ExtraTickComponent && ExtraTickComponent->IsComponentTickEnabled())
+            {
+                ExtraTickComponent->TickComponent(
+                    TestTickSeconds,
+                    LEVELTICK_All,
+                    &ExtraTickComponent->PrimaryComponentTick);
+            }
+
+            if (SecondExtraTickComponent && SecondExtraTickComponent->IsComponentTickEnabled())
+            {
+                SecondExtraTickComponent->TickComponent(
+                    TestTickSeconds,
+                    LEVELTICK_All,
+                    &SecondExtraTickComponent->PrimaryComponentTick);
+            }
         }
 
         FString DescribeCurrentPath(const FCharacterMoveToHarness& Harness) const
@@ -3970,10 +4026,15 @@ bool FOmniNavigationBehaviorTreeJumpObservedGoalRepathTest::RunTest(const FStrin
         return false;
     }
 
+    // The observed-goal retarget intentionally sends the same BT Move To back
+    // to the source island after the first Jump completes. Author this fixture
+    // as BothWays so the deferred return request has a legal Recast path. A
+    // one-way SourceToTarget link would correctly strand the second request on
+    // the target island and would test topology failure rather than BT retarget.
     AOmniPointNavLink* Point = TestWorld.AddPointLink(
         LeftLinkEndpoint,
         RightLinkEndpoint,
-        EOmniPointLinkDirection::SourceToTarget);
+        EOmniPointLinkDirection::BothWays);
     if (!TestNotNull(TEXT("Omni Behavior Tree Jump repath actor"), Point))
     {
         return false;
@@ -3989,6 +4050,19 @@ bool FOmniNavigationBehaviorTreeJumpObservedGoalRepathTest::RunTest(const FStrin
 
     if (!TestNotNull(TEXT("Behavior Tree Jump repath runtime component"), Point->JumpTraversal.Get())
         || !TestWorld.BuildNavigation())
+    {
+        return false;
+    }
+
+    // Guard the fixture topology explicitly. The test changes its observed goal
+    // back to the source island after completing the first Jump, so both legs
+    // must be reachable before Behavior Tree semantics are exercised.
+    if (!TestTrue(
+            TEXT("Behavior Tree Jump repath fixture has a complete source-to-target path"),
+            TestWorld.HasCompletePath(LeftQuery, RightQuery))
+        || !TestTrue(
+            TEXT("Behavior Tree Jump repath fixture has a complete target-to-source path"),
+            TestWorld.HasCompletePath(RightQuery, LeftQuery)))
     {
         return false;
     }
@@ -4018,54 +4092,87 @@ bool FOmniNavigationBehaviorTreeJumpObservedGoalRepathTest::RunTest(const FStrin
     TestNotNull(TEXT("Behavior Tree Jump repath reaches the generated custom link"), OldCustomLink);
     TestEqual(TEXT("Behavior Tree Jump repath has one active Omni traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 1);
 
-    // UBTTask_MoveTo observes this vector key. Retargeting it while the smart link
-    // owns path following must supersede the old traversal and keep the Behavior
-    // Tree task authoritative, rather than completing or aborting the stale Jump.
+    const FAIRequestID OriginalMoveRequestId = MoveHarness.PathFollowing->GetCurrentRequestId();
+    TestTrue(TEXT("Behavior Tree Jump repath starts from a valid PathFollowing request"), OriginalMoveRequestId.IsValid());
+
+    // Stock AAIController intentionally postpones path updates while PathFollowing
+    // reports HasStartedNavLinkMove(). UBTTask_MoveTo therefore does not replace
+    // the active Jump immediately when its observed blackboard goal changes. It
+    // updates the reused UAITask_MoveTo request and retries ConditionalPerformMove()
+    // on a 0.2-second gameplay timer after the nav-link move can safely finish.
     BTHarness.Blackboard->SetValueAsVector(BTHarness.GoalKey, LeftQuery);
     BTHarness.BehaviorTree->TickComponent(
         TestTickSeconds,
         LEVELTICK_All,
         &BTHarness.BehaviorTree->PrimaryComponentTick);
 
-    TestTrue(TEXT("Behavior Tree Jump repath leaves old custom-link ownership"),
-        MoveHarness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink);
+    TestTrue(TEXT("Behavior Tree Jump retarget defers while the current nav-link move owns PathFollowing"),
+        MoveHarness.PathFollowing->GetCurrentCustomLinkOb() == OldCustomLink);
+    TestEqual(TEXT("Behavior Tree Jump retarget keeps the current Omni traversal until normal link completion"),
+        Point->JumpTraversal->GetActiveTraversalCount(),
+        1);
+    TestTrue(TEXT("Behavior Tree Jump retarget keeps the original PathFollowing request while nav-link movement is active"),
+        MoveHarness.PathFollowing->GetCurrentRequestId().IsEquivalent(OriginalMoveRequestId));
 
-    Point->JumpTraversal->TickComponent(
-        TestTickSeconds,
-        LEVELTICK_All,
-        &Point->JumpTraversal->PrimaryComponentTick);
+    bool bObservedJumpCompletion = false;
+    bool bObservedDeferredRetargetRequest = false;
+    bool bReachedRetargetedGoal = false;
+    FAIRequestID DeferredRetargetRequestId = FAIRequestID::InvalidRequest;
 
-    TestEqual(TEXT("Behavior Tree Jump repath drops stale traversal on the next Omni tick"),
-        Point->JumpTraversal->GetActiveTraversalCount(), 0);
-    TestEqual(TEXT("Behavior Tree Jump repath restores the pre-jump movement mode"),
-        static_cast<EMovementMode>(MoveHarness.Movement->MovementMode), MOVE_Flying);
-    TestTrue(TEXT("Behavior Tree Jump repath clears stale ballistic velocity"),
-        MoveHarness.Movement->Velocity.IsNearlyZero());
-    TestTrue(TEXT("Behavior Tree Jump repath clears any pending launch"),
-        MoveHarness.Movement->PendingLaunchVelocity.IsNearlyZero());
+    const int32 MaxTicks = FMath::Max(
+        1,
+        static_cast<int32>(8.0 / static_cast<double>(TestTickSeconds)) + 1);
 
-    bool bReachedGoal = false;
-    bool bObservedNavigationLinkSegment = false;
-    FPathFollowingResult CompletionResult;
-    const bool bCompleted = TestWorld.WaitForCharacterMoveToCompletion(
-        MoveHarness,
-        bReachedGoal,
-        bObservedNavigationLinkSegment,
-        5.0,
-        BTHarness.BehaviorTree,
-        nullptr,
-        &CompletionResult,
-        Point->JumpTraversal);
-
-    if (!bReachedGoal)
+    for (int32 TickIndex = 0; TickIndex < MaxTicks; ++TickIndex)
     {
-        AddInfo(FString::Printf(TEXT("Behavior Tree Jump repath completion result: %s"), *CompletionResult.ToString()));
+        TestWorld.TickCharacterMoveToSyntheticFrame(
+            MoveHarness,
+            BTHarness.BehaviorTree,
+            Point->JumpTraversal,
+            true);
+
+        bObservedJumpCompletion |= Point->JumpTraversal->GetActiveTraversalCount() == 0
+            && MoveHarness.PathFollowing->GetCurrentCustomLinkOb() != OldCustomLink;
+
+        const FAIRequestID CurrentRequestId = MoveHarness.PathFollowing->GetCurrentRequestId();
+        if (CurrentRequestId.IsValid() && !CurrentRequestId.IsEquivalent(OriginalMoveRequestId))
+        {
+            bObservedDeferredRetargetRequest = true;
+            DeferredRetargetRequestId = CurrentRequestId;
+        }
+
+        if (bObservedDeferredRetargetRequest
+            && MoveHarness.PathFollowing->GetStatus() == EPathFollowingStatus::Idle
+            && MoveHarness.PathFollowing->DidMoveReachGoal()
+            && MoveHarness.Character->GetActorLocation().X < -250.0f)
+        {
+            bReachedRetargetedGoal = true;
+            break;
+        }
     }
 
-    TestTrue(TEXT("Behavior Tree Jump repath completes"), bCompleted);
-    TestTrue(TEXT("Behavior Tree Jump repath reaches the updated source-side goal"), bReachedGoal);
-    TestTrue(TEXT("Behavior Tree Jump repath physically returns to the source island"), MoveHarness.Character->GetActorLocation().X < -250.0f);
-    TestEqual(TEXT("Behavior Tree Jump repath leaves no stale traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 0);
+    if (!bReachedRetargetedGoal)
+    {
+        AddInfo(FString::Printf(
+            TEXT("Behavior Tree deferred Jump retarget diagnostics: OriginalRequest=%s DeferredRequest=%s CurrentRequest=%s ActiveTraversal=%d CurrentCustomLink=%s Final=%s Status=%d DidReachGoal=%d MovementMode=%d Velocity=%s PendingLaunch=%s"),
+            *OriginalMoveRequestId.ToString(),
+            *DeferredRetargetRequestId.ToString(),
+            *MoveHarness.PathFollowing->GetCurrentRequestId().ToString(),
+            Point->JumpTraversal->GetActiveTraversalCount(),
+            *GetNameSafe(MoveHarness.PathFollowing->GetCurrentCustomLinkOb()),
+            *MoveHarness.Character->GetActorLocation().ToCompactString(),
+            static_cast<int32>(MoveHarness.PathFollowing->GetStatus()),
+            MoveHarness.PathFollowing->DidMoveReachGoal() ? 1 : 0,
+            static_cast<int32>(MoveHarness.Movement->MovementMode),
+            *MoveHarness.Movement->Velocity.ToCompactString(),
+            *MoveHarness.Movement->PendingLaunchVelocity.ToCompactString()));
+    }
+
+    TestTrue(TEXT("Behavior Tree Jump retarget lets the current Jump finish normally before repathing"), bObservedJumpCompletion);
+    TestTrue(TEXT("Behavior Tree Jump retarget issues a new PathFollowing request after nav-link completion"), bObservedDeferredRetargetRequest);
+    TestTrue(TEXT("Behavior Tree Jump retarget reaches the updated source-side goal"), bReachedRetargetedGoal);
+    TestTrue(TEXT("Behavior Tree Jump retarget physically returns to the source island"), MoveHarness.Character->GetActorLocation().X < -250.0f);
+    TestEqual(TEXT("Behavior Tree Jump retarget leaves no active Omni traversal"), Point->JumpTraversal->GetActiveTraversalCount(), 0);
     return true;
 }
 
