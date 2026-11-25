@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AITypes.h"
 #include "AI/Navigation/NavAgentSelector.h"
 #include "Components/ActorComponent.h"
 #include "OmniTypes.h"
@@ -39,6 +40,13 @@ public:
         float InLandingTolerance,
         float InTraversalTimeout);
 
+    /**
+     * Toggle the existing generated Mantle smart links without destroying their
+     * navigation identity. Disabling also cancels any traversal currently owned
+     * by this component and restores its previous movement mode.
+     */
+    void SetLinksEnabled(bool bEnabled);
+
     void ClearLinks();
 
     int32 GetGeneratedLinkCount() const { return MantleLinks.Num(); }
@@ -48,6 +56,7 @@ private:
     struct FActiveMantleTraversal
     {
         TWeakObjectPtr<UPathFollowingComponent> PathFollowing;
+        FAIRequestID MoveRequestId = FAIRequestID::InvalidRequest;
         TWeakObjectPtr<ACharacter> Character;
         TWeakObjectPtr<UNavLinkCustomComponent> Link;
         FVector Start = FVector::ZeroVector;

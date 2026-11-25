@@ -1,7 +1,7 @@
 {
     "FileVersion": 3,
-    "Version": 110,
-    "VersionName": "0.73.3",
+    "Version": 118,
+    "VersionName": "0.76.1",
     "FriendlyName": "Omni",
     "Description": "Enhanced point, volume, and spline navigation links with Native, Jump, Mantle, Automatic, Custom, directional traversal, generation-time traversal validation, path costs, height-aware filtering, and live previews.",
     "Category": "AI",
@@ -17,6 +17,11 @@
         {
             "Name": "Omni",
             "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "OmniEditor",
+            "Type": "Editor",
             "LoadingPhase": "Default"
         }
     ]

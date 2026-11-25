@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AITypes.h"
 #include "AI/Navigation/NavAgentSelector.h"
 #include "Components/ActorComponent.h"
 #include "OmniTypes.h"
@@ -101,7 +102,15 @@ public:
 
     /** Current effective enabled state shared by the generated Custom smart links. */
     UFUNCTION(BlueprintPure, Category="Omni|Custom Traversal", meta=(DisplayName="Are Custom Links Enabled"))
-    bool AreLinksEnabled() const { return bCachedLinksEnabled; }
+    bool AreLinksEnabled() const { return bOwnerEnabled && bCachedLinksEnabled; }
+
+    /**
+     * Gate the generated Custom smart links from the owning Omni actor without
+     * discarding their registered navigation identity. Disabling cancels any
+     * active Custom requests. This is separate from the project's runtime
+     * SetLinksEnabled override.
+     */
+    void SetOwnerEnabled(bool bEnabled);
 
     /** Synchronize generated Custom smart links with the authoring actor. */
     void RebuildLinks(
@@ -123,6 +132,7 @@ private:
     {
         FOmniCustomTraversalRequest Request;
         TWeakObjectPtr<UPathFollowingComponent> PathFollowing;
+        FAIRequestID MoveRequestId = FAIRequestID::InvalidRequest;
         TWeakObjectPtr<UNavLinkCustomComponent> Link;
         float ElapsedTime = 0.0f;
     };
@@ -148,8 +158,13 @@ private:
     // Authored/default state supplied by the owning Omni actor on the most recent rebuild.
     bool bCachedAuthoredLinksEnabled = true;
 
-    // Effective runtime state. SetLinksEnabled may temporarily override the authored default.
+    // Requested runtime state. SetLinksEnabled may temporarily override the authored default.
     bool bCachedLinksEnabled = true;
     bool bHasRuntimeEnabledOverride = false;
+
+    // Owning Omni actor gate. This is intentionally independent from the project's
+    // Custom runtime override so bEnabled can temporarily hide the link and then
+    // restore the prior authored/runtime state without recreating the component.
+    bool bOwnerEnabled = true;
     bool bHasCachedConfiguration = false;
 };

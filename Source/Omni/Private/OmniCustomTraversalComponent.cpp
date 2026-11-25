@@ -60,7 +60,8 @@ void UOmniCustomTraversalComponent::RebuildLinks(
         bHasRuntimeEnabledOverride = false;
     }
 
-    const bool bEffectiveLinksEnabled = bHasRuntimeEnabledOverride ? bCachedLinksEnabled : bLinksEnabled;
+    const bool bRequestedLinksEnabled = bHasRuntimeEnabledOverride ? bCachedLinksEnabled : bLinksEnabled;
+    const bool bEffectiveLinksEnabled = bOwnerEnabled && bRequestedLinksEnabled;
 
     TraversalTimeout = FMath::Max(0.25f, InTraversalTimeout);
 
@@ -153,7 +154,7 @@ void UOmniCustomTraversalComponent::RebuildLinks(
     CachedAreaClass = AreaClass.Get();
     CachedDisabledAreaClass = DisabledAreaClass.Get();
     bCachedAuthoredLinksEnabled = bLinksEnabled;
-    bCachedLinksEnabled = bEffectiveLinksEnabled;
+    bCachedLinksEnabled = bRequestedLinksEnabled;
     bHasCachedConfiguration = true;
 }
 
@@ -161,12 +162,65 @@ void UOmniCustomTraversalComponent::SetLinksEnabled(bool bEnabled)
 {
     bCachedLinksEnabled = bEnabled;
     bHasRuntimeEnabledOverride = true;
+    const bool bEffectiveLinksEnabled = bOwnerEnabled && bEnabled;
     for (UNavLinkCustomComponent* Link : CustomLinks)
     {
         if (IsValid(Link))
         {
-            Link->SetEnabled(bEnabled);
+            const bool bWasEnabled = Link->IsEnabled();
+            Link->SetEnabled(bEffectiveLinksEnabled);
+
+            // Runtime Custom enable toggles can pass through the same disabled-build
+            // lifecycle as the owning actor gate. Refresh the stock custom-link
+            // registration only when the preserved link actually transitions back
+            // to enabled, keeping object identity and project-facing override state.
+            if (bEffectiveLinksEnabled && !bWasEnabled && Link->IsRegistered() && Link->GetWorld())
+            {
+                Link->ReregisterComponent();
+            }
         }
+    }
+}
+
+void UOmniCustomTraversalComponent::SetOwnerEnabled(bool bEnabled)
+{
+    bOwnerEnabled = bEnabled;
+
+    if (!bEnabled)
+    {
+        for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
+        {
+            FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
+        }
+    }
+
+    const bool bRequestedLinksEnabled = bHasRuntimeEnabledOverride
+        ? bCachedLinksEnabled
+        : bCachedAuthoredLinksEnabled;
+    const bool bEffectiveLinksEnabled = bOwnerEnabled && bRequestedLinksEnabled;
+
+    for (UNavLinkCustomComponent* Link : CustomLinks)
+    {
+        if (IsValid(Link))
+        {
+            const bool bWasEnabled = Link->IsEnabled();
+            Link->SetEnabled(bEffectiveLinksEnabled);
+
+            // SetEnabled() updates the Recast area/modifier state, but a full nav
+            // rebuild while disabled can still leave the off-mesh path ID detached
+            // from UNavigationSystemV1's custom-link lookup. Re-register the same
+            // component on disabled -> enabled so PathFollowing can resolve the
+            // CustomNavLinkId and enter the traversal callback again.
+            if (bEffectiveLinksEnabled && !bWasEnabled && Link->IsRegistered() && Link->GetWorld())
+            {
+                Link->ReregisterComponent();
+            }
+        }
+    }
+
+    if (!bEnabled)
+    {
+        SetComponentTickEnabled(false);
     }
 }
 
@@ -196,6 +250,7 @@ void UOmniCustomTraversalComponent::ClearLinks()
     bCachedAuthoredLinksEnabled = true;
     bCachedLinksEnabled = true;
     bHasRuntimeEnabledOverride = false;
+    bOwnerEnabled = true;
     bHasCachedConfiguration = false;
     SetComponentTickEnabled(false);
 }
@@ -232,6 +287,7 @@ void UOmniCustomTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponen
     Traversal.Request.Start = Pawn->GetActorLocation();
     Traversal.Request.Destination = DestinationPoint;
     Traversal.PathFollowing = PathFollowing;
+    Traversal.MoveRequestId = PathFollowing->GetCurrentRequestId();
     Traversal.Link = LinkComp;
     Traversal.ElapsedTime = 0.0f;
 
@@ -323,7 +379,8 @@ void UOmniCustomTraversalComponent::TickComponent(float DeltaTime, ELevelTick Ti
         // AI MoveTo/Behavior Tree Move To may abort or replace a move while both
         // objects remain alive. Treat loss of this exact current custom link as an
         // immediate cancellation instead of holding the request until timeout.
-        if (PathFollowing->GetCurrentCustomLinkOb() != Link)
+        if (PathFollowing->GetCurrentCustomLinkOb() != Link
+            || !PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId))
         {
             FinishTraversalAtIndex(Index, EOmniCustomTraversalFinishReason::Cancelled);
             continue;
@@ -351,7 +408,10 @@ void UOmniCustomTraversalComponent::CompleteTraversal(int32 RequestId)
             const FActiveCustomTraversal& Traversal = ActiveTraversals[Index];
             UPathFollowingComponent* PathFollowing = Traversal.PathFollowing.Get();
             UNavLinkCustomComponent* Link = Traversal.Link.Get();
-            const bool bStillOwnsCurrentLink = PathFollowing && Link && PathFollowing->GetCurrentCustomLinkOb() == Link;
+            const bool bStillOwnsCurrentLink = PathFollowing
+                && Link
+                && PathFollowing->GetCurrentCustomLinkOb() == Link
+                && PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId);
             FinishTraversalAtIndex(
                 Index,
                 bStillOwnsCurrentLink ? EOmniCustomTraversalFinishReason::Completed : EOmniCustomTraversalFinishReason::Cancelled);
@@ -367,7 +427,10 @@ void UOmniCustomTraversalComponent::CompleteAllTraversals()
         const FActiveCustomTraversal& Traversal = ActiveTraversals[Index];
         UPathFollowingComponent* PathFollowing = Traversal.PathFollowing.Get();
         UNavLinkCustomComponent* Link = Traversal.Link.Get();
-        const bool bStillOwnsCurrentLink = PathFollowing && Link && PathFollowing->GetCurrentCustomLinkOb() == Link;
+        const bool bStillOwnsCurrentLink = PathFollowing
+            && Link
+            && PathFollowing->GetCurrentCustomLinkOb() == Link
+            && PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId);
         FinishTraversalAtIndex(
             Index,
             bStillOwnsCurrentLink ? EOmniCustomTraversalFinishReason::Completed : EOmniCustomTraversalFinishReason::Cancelled);
@@ -418,7 +481,8 @@ void UOmniCustomTraversalComponent::FinishTraversalAtIndex(int32 Index, EOmniCus
             // Completion is only valid while this request still owns Unreal's current
             // custom link. Do not let late Blueprint completion or stale teardown
             // resume/advance a newer AI move that has already replaced this one.
-            if (PathFollowing->GetCurrentCustomLinkOb() == Link)
+            if (PathFollowing->GetCurrentCustomLinkOb() == Link
+                && PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId))
             {
                 PathFollowing->FinishUsingCustomLink(Link);
             }

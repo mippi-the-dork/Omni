@@ -135,6 +135,44 @@ void UOmniJumpTraversalComponent::RebuildLinks(
     bHasCachedConfiguration = true;
 }
 
+void UOmniJumpTraversalComponent::SetLinksEnabled(bool bEnabled)
+{
+    if (!bEnabled)
+    {
+        for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
+        {
+            FinishTraversalAtIndex(Index, true);
+        }
+    }
+
+    for (UNavLinkCustomComponent* Link : JumpLinks)
+    {
+        if (IsValid(Link))
+        {
+            const bool bWasEnabled = Link->IsEnabled();
+            Link->SetEnabled(bEnabled);
+
+            // A full Recast rebuild performed while this preserved smart link is
+            // disabled can leave a valid off-mesh connection whose CustomNavLinkId
+            // no longer resolves through UNavigationSystemV1's custom-link lookup.
+            // Pathfinding then succeeds, but PathFollowing stalls at the link entrance
+            // because it cannot recover the INavLinkCustomInterface that owns the ID.
+            // Re-run the stock component registration lifecycle on disabled -> enabled
+            // transitions so OnUnregister/OnRegister refresh both the repository/map
+            // entry and the nav-octree representation without changing object identity.
+            if (bEnabled && !bWasEnabled && Link->IsRegistered() && Link->GetWorld())
+            {
+                Link->ReregisterComponent();
+            }
+        }
+    }
+
+    if (!bEnabled)
+    {
+        SetComponentTickEnabled(false);
+    }
+}
+
 void UOmniJumpTraversalComponent::ClearLinks()
 {
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
@@ -197,6 +235,7 @@ void UOmniJumpTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponent*
 
     FActiveJumpTraversal& Traversal = ActiveTraversals.Emplace_GetRef();
     Traversal.PathFollowing = PathFollowing;
+    Traversal.MoveRequestId = PathFollowing->GetCurrentRequestId();
     Traversal.Character = Character;
     Traversal.Link = LinkComp;
     Traversal.Destination = CharacterDestination;
@@ -227,7 +266,8 @@ void UOmniJumpTraversalComponent::TickComponent(float DeltaTime, ELevelTick Tick
         // A PathFollowingComponent can remain valid after its move was aborted,
         // replaced, or repathed. Only keep controlling this traversal while Unreal
         // still reports this exact generated smart link as the active custom link.
-        if (PathFollowing->GetCurrentCustomLinkOb() != Link)
+        if (PathFollowing->GetCurrentCustomLinkOb() != Link
+            || !PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId))
         {
             FinishTraversalAtIndex(Index, true);
             continue;
@@ -294,7 +334,8 @@ void UOmniJumpTraversalComponent::FinishTraversalAtIndex(int32 Index, bool bRest
         {
             // Do not finish a stale link after AI MoveTo/BT Move To has already
             // aborted or replaced the request and moved path following elsewhere.
-            if (PathFollowing->GetCurrentCustomLinkOb() == Link)
+            if (PathFollowing->GetCurrentCustomLinkOb() == Link
+                && PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId))
             {
                 PathFollowing->FinishUsingCustomLink(Link);
             }

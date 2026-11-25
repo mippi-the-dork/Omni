@@ -12,29 +12,9 @@ public class Omni : ModuleRules
                 "Core",
                 "CoreUObject",
                 "Engine",
-                "NavigationSystem"
-            }
-        );
-
-        PrivateDependencyModuleNames.AddRange(
-            new string[]
-            {
+                "NavigationSystem",
                 "AIModule"
             }
         );
-
-        if (Target.bBuildEditor)
-        {
-            PrivateDependencyModuleNames.AddRange(
-                new string[]
-                {
-                    "UnrealEd",
-                    "ToolMenus",
-                    "Slate",
-                    "SlateCore",
-                    "GameplayTasks"
-                }
-            );
-        }
     }
 }

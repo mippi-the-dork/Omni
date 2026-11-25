@@ -149,6 +149,42 @@ void UOmniMantleTraversalComponent::RebuildLinks(
     bHasCachedConfiguration = true;
 }
 
+void UOmniMantleTraversalComponent::SetLinksEnabled(bool bEnabled)
+{
+    if (!bEnabled)
+    {
+        for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
+        {
+            FinishTraversalAtIndex(Index, false);
+        }
+    }
+
+    for (UNavLinkCustomComponent* Link : MantleLinks)
+    {
+        if (IsValid(Link))
+        {
+            const bool bWasEnabled = Link->IsEnabled();
+            Link->SetEnabled(bEnabled);
+
+            // Preserve object identity across temporary disable, but refresh Unreal's
+            // custom-link registration after the link becomes usable again. A Recast
+            // rebuild while disabled can otherwise leave the path's CustomNavLinkId
+            // structurally present while UNavigationSystemV1 no longer resolves it for
+            // PathFollowing. ReregisterComponent() exercises the normal public
+            // OnUnregister/OnRegister lifecycle on the same component instance.
+            if (bEnabled && !bWasEnabled && Link->IsRegistered() && Link->GetWorld())
+            {
+                Link->ReregisterComponent();
+            }
+        }
+    }
+
+    if (!bEnabled)
+    {
+        SetComponentTickEnabled(false);
+    }
+}
+
 void UOmniMantleTraversalComponent::ClearLinks()
 {
     for (int32 Index = ActiveTraversals.Num() - 1; Index >= 0; --Index)
@@ -206,6 +242,7 @@ void UOmniMantleTraversalComponent::HandleMoveReachedLink(UNavLinkCustomComponen
 
     FActiveMantleTraversal& Traversal = ActiveTraversals.Emplace_GetRef();
     Traversal.PathFollowing = PathFollowing;
+    Traversal.MoveRequestId = PathFollowing->GetCurrentRequestId();
     Traversal.Character = Character;
     Traversal.Link = LinkComp;
     Traversal.Start = Character->GetActorLocation();
@@ -244,7 +281,8 @@ void UOmniMantleTraversalComponent::TickComponent(float DeltaTime, ELevelTick Ti
         // The path-following object can outlive the move that entered this link.
         // Stop the mantle immediately if Unreal has aborted/replaced the request or
         // switched to another custom link, and restore the character movement mode.
-        if (PathFollowing->GetCurrentCustomLinkOb() != Link)
+        if (PathFollowing->GetCurrentCustomLinkOb() != Link
+            || !PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId))
         {
             FinishTraversalAtIndex(Index, false);
             continue;
@@ -316,7 +354,8 @@ void UOmniMantleTraversalComponent::FinishTraversalAtIndex(int32 Index, bool bSn
         {
             // Only release path following when this traversal still owns the current
             // custom link. A newer move/link must never be completed by stale cleanup.
-            if (PathFollowing->GetCurrentCustomLinkOb() == Link)
+            if (PathFollowing->GetCurrentCustomLinkOb() == Link
+                && PathFollowing->GetCurrentRequestId().IsEquivalent(Traversal.MoveRequestId))
             {
                 PathFollowing->FinishUsingCustomLink(Link);
             }

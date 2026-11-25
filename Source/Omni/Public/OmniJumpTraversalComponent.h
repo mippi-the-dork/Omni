@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AITypes.h"
 #include "AI/Navigation/NavAgentSelector.h"
 #include "Components/ActorComponent.h"
 #include "OmniTypes.h"
@@ -39,6 +40,13 @@ public:
         float InLandingTolerance,
         float InTraversalTimeout);
 
+    /**
+     * Toggle the existing generated Jump smart links without destroying their
+     * navigation identity. Disabling also cancels any traversal currently owned
+     * by this component and restores its pre-jump movement state.
+     */
+    void SetLinksEnabled(bool bEnabled);
+
     /** Remove every generated jump link. */
     void ClearLinks();
 
@@ -49,6 +57,7 @@ private:
     struct FActiveJumpTraversal
     {
         TWeakObjectPtr<UPathFollowingComponent> PathFollowing;
+        FAIRequestID MoveRequestId = FAIRequestID::InvalidRequest;
         TWeakObjectPtr<ACharacter> Character;
         TWeakObjectPtr<UNavLinkCustomComponent> Link;
         FVector Destination = FVector::ZeroVector;

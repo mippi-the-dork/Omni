@@ -352,8 +352,13 @@ void AOmniPointNavLink::RegenerateLink()
 
     if (JumpTraversal)
     {
-        if (bEnabled && !NewJumpLinks.IsEmpty())
+        if (!bEnabled)
         {
+            JumpTraversal->SetLinksEnabled(false);
+        }
+        else if (!NewJumpLinks.IsEmpty())
+        {
+            JumpTraversal->SetLinksEnabled(true);
             JumpTraversal->RebuildLinks(NewJumpLinks, SupportedAgents, JumpAreaClass, JumpApexHeight, JumpLandingTolerance, JumpTraversalTimeout);
         }
         else
@@ -364,8 +369,13 @@ void AOmniPointNavLink::RegenerateLink()
 
     if (MantleTraversal)
     {
-        if (bEnabled && !NewMantleLinks.IsEmpty())
+        if (!bEnabled)
         {
+            MantleTraversal->SetLinksEnabled(false);
+        }
+        else if (!NewMantleLinks.IsEmpty())
+        {
+            MantleTraversal->SetLinksEnabled(true);
             MantleTraversal->RebuildLinks(NewMantleLinks, SupportedAgents, MantleAreaClass, MantleDuration, MantleArcHeight, MantleLandingTolerance, MantleTraversalTimeout);
         }
         else
@@ -376,8 +386,13 @@ void AOmniPointNavLink::RegenerateLink()
 
     if (CustomTraversal)
     {
-        if (bEnabled && !NewCustomLinks.IsEmpty())
+        if (!bEnabled)
         {
+            CustomTraversal->SetOwnerEnabled(false);
+        }
+        else if (!NewCustomLinks.IsEmpty())
+        {
+            CustomTraversal->SetOwnerEnabled(true);
             CustomTraversal->RebuildLinks(NewCustomLinks, SupportedAgents, AreaClass, CustomDisabledAreaClass, bCustomLinkEnabled, CustomTraversalTimeout);
         }
         else
