@@ -1,4 +1,4 @@
-**Current development build: 0.76.1** - Begins 1.0 release hardening by separating runtime navigation/traversal from editor-only tooling. The verified baseline entering this pass is 13/13 RuntimeMutation and 70/70 full Omni automation.
+**Current development build: 0.76.3** - Begins 1.0 release hardening by separating runtime navigation/traversal from editor-only tooling. The verified baseline entering this pass is 13/13 RuntimeMutation and 70/70 full Omni automation.
 
 # Omni
 
